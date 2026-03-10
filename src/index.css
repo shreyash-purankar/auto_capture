@@ -1,0 +1,19 @@
+@import "tailwindcss";
+
+@layer utilities {
+  .kyc-glass {
+    @apply bg-white/5 backdrop-blur-xl border border-white/10;
+  }
+}
+
+@keyframes scan {
+  0% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(100vh);
+  }
+  100% {
+    transform: translateY(0);
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "name": "KYC Scanner",
+  "description": "A hands-free, automated sequence to capture an ID Card and a Face image.",
+  "requestFramePermissions": ["camera"]
+}
