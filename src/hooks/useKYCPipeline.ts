@@ -20,6 +20,11 @@ export const useKYCPipeline = () => {
     const [boundingBox, setBoundingBox] = useState<BoundingBox | null>(null);
     const [isMocking, setIsMocking] = useState(false);
     const [progress, setProgress] = useState(0);
+    const [isMirrored, setIsMirrored] = useState(true);
+
+    const isMobile = useCallback(() => {
+        return /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+    }, []);
 
     // Initialize Web Worker
     useEffect(() => {
@@ -54,6 +59,9 @@ export const useKYCPipeline = () => {
             }
         };
 
+        const isHighEnd = navigator.hardwareConcurrency ? navigator.hardwareConcurrency >= 4 : false;
+        worker.postMessage({ type: 'INIT', tier: isHighEnd ? 'high' : 'low' });
+
         worker.onerror = (err) => {
             console.error("[Main] Worker Error Encountered:", err);
             isProcessingWorker.current = false; // Release lock on error
@@ -76,13 +84,39 @@ export const useKYCPipeline = () => {
         let stream: MediaStream | null = null;
         const startCamera = async () => {
             console.log("[Main] Requesting Camera Permissions...");
+            
+            const mobile = isMobile();
+            let facingMode: ConstrainDOMString = 'environment';
+            let mirror = true;
+
+            if (mobile) {
+                if (currentStage === KYCStage.FACE_CAPTURE) {
+                    facingMode = 'user';
+                    mirror = true;
+                } else {
+                    facingMode = 'environment';
+                    mirror = false;
+                }
+            } else {
+                // Desktop stays as it was (environment/default, mirrored)
+                facingMode = 'environment';
+                mirror = true;
+            }
+
+            setIsMirrored(mirror);
+
             try {
                 stream = await navigator.mediaDevices.getUserMedia({
-                    video: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } }
+                    video: { 
+                        facingMode, 
+                        width: { min: 1280, ideal: 1920, max: 4096 }, 
+                        height: { min: 720, ideal: 1080, max: 2160 },
+                        aspectRatio: { ideal: 1.7777777778 } // 16:9
+                    }
                 });
                 if (videoRef.current) {
                     videoRef.current.srcObject = stream;
-                    console.log("[Main] Camera access granted and stream attached.");
+                    console.log(`[Main] Camera access granted (${facingMode}) and stream attached.`);
                 }
             } catch (e) {
                 console.error("[Main] Camera Access Failed:", e);
@@ -97,7 +131,7 @@ export const useKYCPipeline = () => {
                 stream.getTracks().forEach(track => track.stop());
             }
         };
-    }, []);
+    }, [currentStage, isMobile]);
 
     // Headless Processing Loop
     useEffect(() => {
@@ -106,7 +140,7 @@ export const useKYCPipeline = () => {
         let lastProcessedTime = 0;
 
         const isHighEnd = navigator.hardwareConcurrency ? navigator.hardwareConcurrency >= 4 : false;
-        const throttleMs = isHighEnd ? 33 : 150;
+        const throttleMs = isHighEnd ? 33 : 166; // 6fps for Tier 2 (Low-End Mobile)
         console.log(`[Main] Performance Tier set: isHighEnd = ${isHighEnd}, throttleMs = ${throttleMs}ms`);
 
         const processFrame = (timestamp: number) => {
@@ -118,6 +152,11 @@ export const useKYCPipeline = () => {
 
                 if (video && canvas && workerRef.current && video.readyState >= 2 && video.videoWidth > 0) {
                     const ctx = canvas.getContext('2d', { willReadFrequently: true });
+                    
+                    // Force the internal buffer to stay at native resolution
+                    if (video.width !== video.videoWidth) video.width = video.videoWidth;
+                    if (video.height !== video.videoHeight) video.height = video.videoHeight;
+                    
                     if (canvas.width !== video.videoWidth) canvas.width = video.videoWidth;
                     if (canvas.height !== video.videoHeight) canvas.height = video.videoHeight;
 
@@ -127,11 +166,14 @@ export const useKYCPipeline = () => {
                     }
 
                     if (ctx) {
+                        ctx.imageSmoothingEnabled = false; // Preserve raw sensor edges
+                        const win = window as any;
+                        if (!win._kyc_log_once) {
+                            console.log(`[Main] Capture Pipeline Resolution: ${video.videoWidth}x${video.videoHeight}`);
+                            win._kyc_log_once = true;
+                        }
                         try {
-                            ctx.save();
-                            ctx.scale(-1, 1);
-                            ctx.drawImage(video, -canvas.width, 0, canvas.width, canvas.height);
-                            ctx.restore();
+                            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
                             const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
 
                             // --- SET THE LOCK BEFORE SENDING ---
@@ -213,5 +255,5 @@ export const useKYCPipeline = () => {
         }
     }, []);
 
-    return { videoRef, hiddenCanvasRef, overlayCanvasRef, currentStage, feedback, isReadyForNextStage, transitionStage, capturedId, capturedFace, isMocking, forceCapture, progress };
+    return { videoRef, hiddenCanvasRef, overlayCanvasRef, currentStage, feedback, isReadyForNextStage, transitionStage, capturedId, capturedFace, isMocking, forceCapture, progress, isMirrored };
 };

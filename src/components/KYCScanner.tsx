@@ -15,6 +15,7 @@ export default function KYCScanner() {
     isMocking,
     forceCapture,
     progress,
+    isMirrored,
   } = useKYCPipeline();
 
   return (
@@ -22,7 +23,7 @@ export default function KYCScanner() {
       {/* CAMERA VIDEO */}
       <video
         ref={videoRef}
-        className="absolute top-0 left-0 w-full h-full object-cover z-0 -scale-x-100"
+        className={`absolute top-0 left-0 w-full h-full object-cover z-0 ${isMirrored ? '-scale-x-100' : ''}`}
         playsInline
         muted
         autoPlay
@@ -31,18 +32,23 @@ export default function KYCScanner() {
       {/* BOUNDING BOX CANVAS */}
       <canvas
         ref={overlayCanvasRef}
-        className="absolute top-0 left-0 w-full h-full object-cover z-10 pointer-events-none"
+        className={`absolute top-0 left-0 w-full h-full object-cover z-10 pointer-events-none ${isMirrored ? '-scale-x-100' : ''}`}
       />
 
       {/* Hidden Extraction Canvas */}
       <canvas ref={hiddenCanvasRef} className="hidden" />
 
       {/* VIGNETTE & SCANNING LINE */}
-      <div className="absolute top-0 left-0 w-full h-full z-10 pointer-events-none bg-black/20 shadow-[inset_0_0_150px_rgba(0,0,0,0.9)]">
+      <div className={`absolute top-0 left-0 w-full h-full z-10 pointer-events-none bg-black/20 shadow-[inset_0_0_150px_rgba(0,0,0,0.9)] ${(currentStage === KYCStage.ID_CAPTURE || currentStage === KYCStage.FACE_CAPTURE) && isReadyForNextStage ? 'animate-border-pulse' : ''}`}>
         {(currentStage === KYCStage.ID_CAPTURE || currentStage === KYCStage.FACE_CAPTURE) && (
           <div className="absolute top-0 left-0 w-full h-1 bg-emerald-500/50 shadow-[0_0_15px_rgba(16,185,129,0.8)] animate-[scan_3s_ease-in-out_infinite]" />
         )}
       </div>
+
+      {/* FLASH EFFECT */}
+      {isReadyForNextStage && progress > 0.9 && (
+        <div className="absolute inset-0 z-40 bg-white pointer-events-none animate-flash" />
+      )}
 
       {/* HEADER / PROMPTS */}
       <div className="absolute top-10 left-0 w-full flex justify-center z-20 px-4">
@@ -65,8 +71,8 @@ export default function KYCScanner() {
       {/* PICTURE-IN-PICTURE THUMBNAILS */}
       <div className="absolute top-10 right-8 z-30 flex flex-col gap-4">
         {capturedId && (
-          <div className="w-28 h-18 kyc-glass rounded-2xl overflow-hidden shadow-2xl animate-in zoom-in duration-500 border-2 border-emerald-500/50">
-            <img src={capturedId} alt="ID" className="w-full h-full object-cover" />
+          <div className="w-28 h-18 kyc-glass rounded-2xl overflow-hidden shadow-2xl animate-in zoom-in duration-500 border-2 border-emerald-500/50 bg-black/40">
+            <img src={capturedId} alt="ID" className="w-full h-full object-contain" />
             <div className="absolute inset-0 bg-emerald-500/10 flex items-center justify-center">
               <div className="bg-emerald-500 rounded-full p-1 shadow-lg">
                 <svg className="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -77,8 +83,8 @@ export default function KYCScanner() {
           </div>
         )}
         {capturedFace && (
-          <div className="w-24 h-24 kyc-glass rounded-full overflow-hidden shadow-2xl animate-in zoom-in duration-500 border-2 border-emerald-500/50">
-            <img src={capturedFace} alt="Face" className="w-full h-full object-cover" />
+          <div className="w-24 h-24 kyc-glass rounded-full overflow-hidden shadow-2xl animate-in zoom-in duration-500 border-2 border-emerald-500/50 bg-black/40">
+            <img src={capturedFace} alt="Face" className="w-full h-full object-contain" />
             <div className="absolute inset-0 bg-emerald-500/10 flex items-center justify-center">
               <div className="bg-emerald-500 rounded-full p-1 shadow-lg">
                 <svg className="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -140,14 +146,14 @@ export default function KYCScanner() {
             <div className="w-full flex gap-6 mb-12">
               <div className="flex-1 group">
                 <p className="text-[10px] text-emerald-400 font-black uppercase tracking-widest mb-3 text-center opacity-70 group-hover:opacity-100 transition-opacity">ID Card</p>
-                <div className="relative aspect-[3/2] rounded-2xl overflow-hidden border-2 border-white/10 group-hover:border-emerald-500/50 transition-all shadow-xl">
-                  <img src={capturedId!} alt="ID" className="w-full h-full object-cover" />
+                <div className="relative aspect-[3/2] rounded-2xl overflow-hidden border-2 border-white/10 group-hover:border-emerald-500/50 transition-all shadow-xl bg-black/40">
+                  <img src={capturedId!} alt="ID" className="w-full h-full object-contain" style={{ imageRendering: 'crisp-edges' }} />
                 </div>
               </div>
               <div className="flex-1 group">
                 <p className="text-[10px] text-emerald-400 font-black uppercase tracking-widest mb-3 text-center opacity-70 group-hover:opacity-100 transition-opacity">Selfie</p>
-                <div className="relative aspect-square rounded-2xl overflow-hidden border-2 border-white/10 group-hover:border-emerald-500/50 transition-all shadow-xl">
-                  <img src={capturedFace!} alt="Face" className="w-full h-full object-cover" />
+                <div className="relative aspect-square rounded-2xl overflow-hidden border-2 border-white/10 group-hover:border-emerald-500/50 transition-all shadow-xl bg-black/40">
+                  <img src={capturedFace!} alt="Face" className="w-full h-full object-contain" />
                 </div>
               </div>
             </div>
