@@ -16,6 +16,7 @@ export default function KYCScanner() {
     forceCapture,
     progress,
     isMirrored,
+    resetFlow,
   } = useKYCPipeline();
 
   return (
@@ -71,7 +72,7 @@ export default function KYCScanner() {
       {/* PICTURE-IN-PICTURE THUMBNAILS */}
       <div className="absolute top-10 right-8 z-30 flex flex-col gap-4">
         {capturedId && (
-          <div className="w-28 h-18 kyc-glass rounded-2xl overflow-hidden shadow-2xl animate-in zoom-in duration-500 border-2 border-emerald-500/50 bg-black/40">
+          <div className="w-48 h-32 kyc-glass rounded-2xl overflow-hidden shadow-2xl animate-in zoom-in duration-500 border-2 border-emerald-500/50 bg-black/40">
             <img src={capturedId} alt="ID" className="w-full h-full object-contain" />
             <div className="absolute inset-0 bg-emerald-500/10 flex items-center justify-center">
               <div className="bg-emerald-500 rounded-full p-1 shadow-lg">
@@ -83,7 +84,7 @@ export default function KYCScanner() {
           </div>
         )}
         {capturedFace && (
-          <div className="w-24 h-24 kyc-glass rounded-full overflow-hidden shadow-2xl animate-in zoom-in duration-500 border-2 border-emerald-500/50 bg-black/40">
+          <div className="w-36 h-36 kyc-glass rounded-full overflow-hidden shadow-2xl animate-in zoom-in duration-500 border-2 border-emerald-500/50 bg-black/40">
             <img src={capturedFace} alt="Face" className="w-full h-full object-contain" />
             <div className="absolute inset-0 bg-emerald-500/10 flex items-center justify-center">
               <div className="bg-emerald-500 rounded-full p-1 shadow-lg">
@@ -131,7 +132,7 @@ export default function KYCScanner() {
       {/* FINAL SUCCESS MODAL */}
       {currentStage === KYCStage.DONE && (
         <div className="absolute inset-0 z-50 bg-black/90 backdrop-blur-2xl flex flex-col items-center justify-center p-6 animate-in fade-in duration-700">
-          <div className="kyc-glass p-8 rounded-[40px] shadow-[0_0_100px_rgba(16,185,129,0.2)] max-w-md w-full flex flex-col items-center border border-white/20 animate-in zoom-in slide-in-from-bottom-10 duration-500">
+          <div className="kyc-glass p-8 rounded-[40px] shadow-[0_0_100px_rgba(16,185,129,0.2)] max-w-[60%] w-full flex flex-col items-center border border-white/20 animate-in zoom-in slide-in-from-bottom-10 duration-500">
             <div className="w-20 h-20 bg-emerald-500 text-white rounded-full flex items-center justify-center mb-8 shadow-[0_0_40px_rgba(16,185,129,0.5)]">
               <svg className="w-10 h-10" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={4} d="M5 13l4 4L19 7" />
@@ -143,22 +144,22 @@ export default function KYCScanner() {
             </h1>
             <p className="text-gray-400 text-sm mb-10 text-center font-medium">Your documents have been processed securely.</p>
 
-            <div className="w-full flex gap-6 mb-12">
+            <div className="w-full flex flex-row gap-6 mb-12">
               <div className="flex-1 group">
                 <p className="text-[10px] text-emerald-400 font-black uppercase tracking-widest mb-3 text-center opacity-70 group-hover:opacity-100 transition-opacity">ID Card</p>
-                <div className="relative aspect-[3/2] rounded-2xl overflow-hidden border-2 border-white/10 group-hover:border-emerald-500/50 transition-all shadow-xl bg-black/40">
+                <div className="relative aspect-[4/3] rounded-2xl overflow-hidden border-2 border-white/10 group-hover:border-emerald-500/50 transition-all shadow-xl bg-black/40">
                   <img src={capturedId!} alt="ID" className="w-full h-full object-contain" style={{ imageRendering: 'crisp-edges' }} />
                 </div>
               </div>
               <div className="flex-1 group">
                 <p className="text-[10px] text-emerald-400 font-black uppercase tracking-widest mb-3 text-center opacity-70 group-hover:opacity-100 transition-opacity">Selfie</p>
-                <div className="relative aspect-square rounded-2xl overflow-hidden border-2 border-white/10 group-hover:border-emerald-500/50 transition-all shadow-xl bg-black/40">
-                  <img src={capturedFace!} alt="Face" className="w-full h-full object-contain" />
+                <div className="relative aspect-[4/3] rounded-2xl overflow-hidden border-2 border-white/10 group-hover:border-emerald-500/50 transition-all shadow-xl bg-black/40">
+                  <img src={capturedFace!} alt="Face" className="w-full h-full object-contain" style={{ imageRendering: 'crisp-edges' }} />
                 </div>
               </div>
             </div>
 
-            <button className="w-full py-5 bg-white text-black font-black rounded-2xl hover:bg-emerald-50 hover:scale-[1.02] active:scale-95 transition-all shadow-2xl uppercase tracking-widest text-sm">
+            <button onClick={resetFlow} className="w-full py-5 bg-white text-black font-black rounded-2xl hover:bg-emerald-50 hover:scale-[1.02] active:scale-95 transition-all shadow-2xl uppercase tracking-widest text-sm">
               Complete Onboarding
             </button>
           </div>

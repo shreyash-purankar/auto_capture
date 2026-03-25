@@ -82,6 +82,7 @@ export const useKYCPipeline = () => {
     // Initialize Camera Stream
     useEffect(() => {
         let stream: MediaStream | null = null;
+        let isMounted = true;
         const startCamera = async () => {
             console.log("[Main] Requesting Camera Permissions...");
             
@@ -103,6 +104,7 @@ export const useKYCPipeline = () => {
                 mirror = true;
             }
 
+            if (!isMounted) return;
             setIsMirrored(mirror);
 
             try {
@@ -114,18 +116,23 @@ export const useKYCPipeline = () => {
                         aspectRatio: { ideal: 1.7777777778 } // 16:9
                     }
                 });
-                if (videoRef.current) {
+                if (isMounted && videoRef.current) {
                     videoRef.current.srcObject = stream;
                     console.log(`[Main] Camera access granted (${facingMode}) and stream attached.`);
+                } else if (stream) {
+                    // Component unmounted before stream was attached — release immediately
+                    stream.getTracks().forEach(track => track.stop());
+                    stream = null;
                 }
             } catch (e) {
                 console.error("[Main] Camera Access Failed:", e);
-                setFeedback("Camera access required.");
+                if (isMounted) setFeedback("Camera access required.");
             }
         };
         startCamera();
 
         return () => {
+            isMounted = false;
             if (stream) {
                 console.log("[Main] Stopping Camera Tracks.");
                 stream.getTracks().forEach(track => track.stop());
@@ -143,54 +150,36 @@ export const useKYCPipeline = () => {
         const throttleMs = isHighEnd ? 33 : 166; // 6fps for Tier 2 (Low-End Mobile)
         console.log(`[Main] Performance Tier set: isHighEnd = ${isHighEnd}, throttleMs = ${throttleMs}ms`);
 
-        const processFrame = (timestamp: number) => {
+        const processFrame = async (timestamp: number) => {
             // Check throttle AND ensure worker is NOT busy
             if (timestamp - lastProcessedTime >= throttleMs && !isProcessingWorker.current) {
                 const video = videoRef.current;
-                const canvas = hiddenCanvasRef.current;
                 const overlay = overlayCanvasRef.current;
 
-                if (video && canvas && workerRef.current && video.readyState >= 2 && video.videoWidth > 0) {
-                    const ctx = canvas.getContext('2d', { willReadFrequently: true });
-                    
-                    // Force the internal buffer to stay at native resolution
-                    if (video.width !== video.videoWidth) video.width = video.videoWidth;
-                    if (video.height !== video.videoHeight) video.height = video.videoHeight;
-                    
-                    if (canvas.width !== video.videoWidth) canvas.width = video.videoWidth;
-                    if (canvas.height !== video.videoHeight) canvas.height = video.videoHeight;
-
+                if (video && workerRef.current && video.readyState >= 3 && video.videoWidth > 0 && !video.paused && !video.ended) {
                     if (overlay) {
                         if (overlay.width !== video.videoWidth) overlay.width = video.videoWidth;
                         if (overlay.height !== video.videoHeight) overlay.height = video.videoHeight;
                     }
 
-                    if (ctx) {
-                        ctx.imageSmoothingEnabled = false; // Preserve raw sensor edges
-                        const win = window as any;
-                        if (!win._kyc_log_once) {
-                            console.log(`[Main] Capture Pipeline Resolution: ${video.videoWidth}x${video.videoHeight}`);
-                            win._kyc_log_once = true;
-                        }
-                        try {
-                            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-                            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                    try {
+                        // --- OPTIMIZATION: Use ImageBitmap for zero-copy transfer ---
+                        const bitmap = await createImageBitmap(video);
 
-                            // --- SET THE LOCK BEFORE SENDING ---
-                            isProcessingWorker.current = true;
+                        // --- SET THE LOCK BEFORE SENDING ---
+                        isProcessingWorker.current = true;
 
-                            workerRef.current.postMessage({
-                                stage: currentStage,
-                                frameData: imageData.data,
-                                width: canvas.width,
-                                height: canvas.height,
-                            }, [imageData.data.buffer]);
+                        workerRef.current.postMessage({
+                            stage: currentStage,
+                            bitmap: bitmap,
+                            width: video.videoWidth,
+                            height: video.videoHeight,
+                        }, [bitmap]);
 
-                            lastProcessedTime = timestamp;
-                        } catch (err) {
-                            console.error("[Main] Error reading canvas context data:", err);
-                            isProcessingWorker.current = false;
-                        }
+                        lastProcessedTime = timestamp;
+                    } catch (err) {
+                        console.error("[Main] Error creating ImageBitmap or sending to worker:", err);
+                        isProcessingWorker.current = false;
                     }
                 }
             }
@@ -255,5 +244,17 @@ export const useKYCPipeline = () => {
         }
     }, []);
 
-    return { videoRef, hiddenCanvasRef, overlayCanvasRef, currentStage, feedback, isReadyForNextStage, transitionStage, capturedId, capturedFace, isMocking, forceCapture, progress, isMirrored };
+    const resetFlow = useCallback(() => {
+        console.log("[Main] Resetting KYC flow to PRE_FLIGHT");
+        isProcessingWorker.current = false;
+        setCapturedId(null);
+        setCapturedFace(null);
+        setBoundingBox(null);
+        setProgress(0);
+        setIsReady(false);
+        setFeedback("Initializing...");
+        setCurrentStage(KYCStage.PRE_FLIGHT);
+    }, []);
+
+    return { videoRef, hiddenCanvasRef, overlayCanvasRef, currentStage, feedback, isReadyForNextStage, transitionStage, capturedId, capturedFace, isMocking, forceCapture, progress, isMirrored, resetFlow };
 };

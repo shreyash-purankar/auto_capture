@@ -12,7 +12,17 @@ let faceLandmarker: any = null;
 let cv: any = null;
 let captureTimer = 0;
 let previousBoundingBox: { x: number, y: number, width: number, height: number } | null = null;
+let smoothedBoundingBox: { x: number, y: number, width: number, height: number } | null = null;
 let forceNextCapture = false;
+let currentTier: 'high' | 'low' = 'high';
+let offscreenCanvas: OffscreenCanvas | null = null;
+let offscreenCtx: OffscreenCanvasRenderingContext2D | null = null;
+// Dedicated canvas for ROI crops — avoids thrashing the full-frame canvas dimensions
+let roiCanvas: OffscreenCanvas | null = null;
+let roiCtx: OffscreenCanvasRenderingContext2D | null = null;
+// Feedback debounce state
+let lastFeedbackText = '';
+let feedbackSameCount = 0;
 
 // --- CONFIGURATION CONSTANTS ---
 const CONFIG = {
@@ -22,16 +32,17 @@ const CONFIG = {
     MIN_GLOBAL_VARIANCE: 20,  // Minimum Laplacian variance for the entire frame (lowered from 80)
 
     // ID Capture (YOLO & OpenCV)
-    YOLO_CONFIDENCE: 0.15,    // Minimum confidence score for YOLO ID detection (lowered to 0.15 for extreme sensitivity)
-    ID_MIN_WIDTH_RATIO: 0.30, // ID must take up at least 30% of the frame width (lowered from 0.45 for distance)
-    ID_MAX_DIST_CENTER: 0.8,  // Maximum distance from center (increased to 0.8 to allow close/off-center capture)
+    YOLO_SIZE: 640,           // Input size for YOLOv11
+    YOLO_CONFIDENCE: 0.15,    // Minimum confidence score — kept low so close-up shots (where YOLO loses background context) still fire
+    ID_MIN_WIDTH_RATIO: 0.38, // ID must take up at least 38% of the frame width (closer to camera)
+    ID_MAX_DIST_CENTER: 0.95,  // Maximum distance from center
     ID_ASPECT_RATIO: 1.58,    // Standard ID card aspect ratio (width/height)
-    ID_ASPECT_TOLERANCE: 0.40, // Tolerance for aspect ratio matching (increased to 0.40 for tilted cards)
-    ID_BOX_EXPAND_FACTOR: 0.98, // Multiplier to slightly reduce YOLO bounding box size
-    ID_OPENCV_PADDING: 0.00,  // Padding added to OpenCV tight bounding box (0 = no padding)
-    ID_MIN_VARIANCE: 80,      // Minimum Laplacian variance for the ID crop (increased to 80 for better quality)
-    ID_STABILITY_TOLERANCE: 0.30, // Maximum allowed movement between frames (increased to 0.30 to ignore tremors)
-    ID_CAPTURE_FRAMES: 3,     // Number of consecutive stable frames required to auto-capture (set to 2 for better stability)
+    ID_ASPECT_TOLERANCE: 0.40, // Wide tolerance — close-up perspective distortion skews the ratio
+    ID_BOX_EXPAND_FACTOR: 1.10, // Expand YOLO box by 10% so OpenCV sees full card edges and corners
+    ID_MIN_VARIANCE: 90,     // Minimum Laplacian variance for the ID crop (raised to reject blurry captures)
+    ID_STABILITY_TOLERANCE: 0.25, // Maximum allowed movement between frames
+    ID_CAPTURE_FRAMES: 15,    // Number of consecutive stable frames required to auto-capture
+
 
     // Face Capture (MediaPipe)
     FACE_MIN_WIDTH_RATIO: 0.25, // Face must take up at least 25% of the frame width
@@ -39,8 +50,8 @@ const CONFIG = {
     FACE_MIN_EAR: 0.2,        // Minimum Eye Aspect Ratio (openness)
     FACE_MAX_GAZE_OFFSET: 0.1, // Maximum gaze offset from center
     FACE_MAX_POSE_ANGLE: 0.2, // Maximum head pose angle (yaw/pitch in radians)
-    FACE_MIN_VARIANCE: 40,    // Minimum Laplacian variance for the face crop (lowered to 40 as requested)
-    FACE_CAPTURE_FRAMES: 10,  // Number of consecutive stable frames required to auto-capture
+    FACE_MIN_VARIANCE: 20,    // Minimum Laplacian variance for the face crop (lowered to 40 as requested)
+    FACE_CAPTURE_FRAMES: 20,  // Number of consecutive stable frames required to auto-capture
 };
 
 // Patch atob/btoa onto TF.js's internal env().global object.
@@ -55,12 +66,39 @@ if (tfGlobal && typeof tfGlobal.btoa !== 'function') {
     tfGlobal.btoa = self.btoa.bind(self);
 }
 
+// Apply exponential moving average to smooth bounding box jitter between frames
+const EMA_ALPHA = 0.35;
+function applyEMA(
+    prev: { x: number; y: number; width: number; height: number } | null,
+    next: { x: number; y: number; width: number; height: number }
+): { x: number; y: number; width: number; height: number } {
+    if (!prev) return { ...next };
+    return {
+        x: prev.x + EMA_ALPHA * (next.x - prev.x),
+        y: prev.y + EMA_ALPHA * (next.y - prev.y),
+        width: prev.width + EMA_ALPHA * (next.width - prev.width),
+        height: prev.height + EMA_ALPHA * (next.height - prev.height),
+    };
+}
+
+// Debounce feedback: only emit a new message if it has appeared 2+ times consecutively
+function debounceFeedback(next: string): string {
+    if (next === lastFeedbackText) {
+        feedbackSameCount++;
+    } else {
+        lastFeedbackText = next;
+        feedbackSameCount = 1;
+    }
+    return feedbackSameCount >= 2 ? next : lastFeedbackText || next;
+}
+
 async function initModels(tier?: 'high' | 'low') {
-    console.log(`[Worker] Initializing models for ${tier || 'unknown'} tier...`);
+    currentTier = tier || 'high';
+    console.log(`[Worker] Initializing models for ${currentTier} tier...`);
     try {
-        const preferredBackend = tier === 'low' ? 'wasm' : 'webgl';
+        const preferredBackend = currentTier === 'low' ? 'wasm' : 'webgl';
         console.log(`[Worker] Proactively selecting preferred backend: ${preferredBackend}`);
-        
+
         try {
             await tf.setBackend(preferredBackend);
             await tf.ready();
@@ -295,35 +333,33 @@ async function captureImage(frameData: Uint8ClampedArray, width: number, height:
         cropW = Math.min(width - cropX, Math.floor(box.width));
         cropH = Math.min(height - cropY, Math.floor(box.height));
     }
-    console.log(`[Worker] Capturing RAW lossless image (${cropW}x${cropH})...`);
 
-    const canvas = new OffscreenCanvas(cropW, cropH);
-    const ctx = canvas.getContext('2d', { willReadFrequently: true });
-    if (!ctx) return '';
-
-    // CRITICAL: Disable all smoothing for exact pixel replication
-    ctx.imageSmoothingEnabled = false;
-
-    // Use putImageData for the rawest possible transfer
-    const fullImageData = new ImageData(new Uint8ClampedArray(frameData), width, height);
+    // Extract crop pixels at native resolution — no upscaling
+    const croppedData = new Uint8ClampedArray(cropW * cropH * 4);
     if (!box || (cropX === 0 && cropY === 0 && cropW === width && cropH === height)) {
-        ctx.putImageData(fullImageData, 0, 0);
+        croppedData.set(frameData.subarray(0, cropW * cropH * 4));
     } else {
-        // If we must crop, create a sub-ImageData manually to avoid drawImage interpolation
-        const croppedData = new Uint8ClampedArray(cropW * cropH * 4);
         for (let y = 0; y < cropH; y++) {
             const srcStart = ((cropY + y) * width + cropX) * 4;
             const destStart = y * cropW * 4;
             croppedData.set(frameData.subarray(srcStart, srcStart + cropW * 4), destStart);
         }
-        ctx.putImageData(new ImageData(croppedData, cropW, cropH), 0, 0);
     }
+
+    console.log(`[Worker] Capturing image: ${cropW}x${cropH}...`);
+
+    const canvas = new OffscreenCanvas(cropW, cropH);
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return '';
+
+    ctx.imageSmoothingEnabled = false;
+    ctx.putImageData(new ImageData(croppedData, cropW, cropH), 0, 0);
 
     const blob = await canvas.convertToBlob({ type: "image/png" });
     return new Promise((resolve) => {
         const reader = new FileReader();
         reader.onloadend = () => {
-            console.log("[Worker] Raw capture successful, size:", Math.round((blob.size / 1024)) + "KB");
+            console.log("[Worker] Capture successful, size:", Math.round((blob.size / 1024)) + "KB");
             resolve(reader.result as string);
         };
         reader.readAsDataURL(blob);
@@ -344,143 +380,144 @@ async function captureWarpedImage(imageData: ImageData): Promise<string> {
     });
 }
 
-function processIDCardOpenCV(frameData: Uint8ClampedArray, width: number, height: number, yoloBox: any) {
+function processIDCardOpenCV(roiData: Uint8ClampedArray, rw: number, rh: number, yoloBoxInRoi: any) {
     if (!cv) return null;
 
     let src: any = null;
-    let roi: any = null;
     let gray: any = null;
     let blurred: any = null;
     let edges: any = null;
+    let lines: any = null;
     let contours: any = null;
     let hierarchy: any = null;
-    let warped: any = null;
 
     try {
-        src = cv.matFromImageData(new ImageData(new Uint8ClampedArray(frameData), width, height));
+        src = cv.matFromImageData(new ImageData(new Uint8ClampedArray(roiData), rw, rh));
 
-        // 1. Calculate ROI with 15% padding
-        const padX = yoloBox.width * 0.15;
-        const padY = yoloBox.height * 0.15;
-
-        const rx = Math.max(0, Math.floor(yoloBox.x - padX));
-        const ry = Math.max(0, Math.floor(yoloBox.y - padY));
-        const rw = Math.min(width - rx, Math.floor(yoloBox.width + padX * 2));
-        const rh = Math.min(height - ry, Math.floor(yoloBox.height + padY * 2));
-
-        const rect = new cv.Rect(rx, ry, rw, rh);
-        roi = src.roi(rect);
-
-        // 2. Preprocess
+        // 1. Preprocess
         gray = new cv.Mat();
-        cv.cvtColor(roi, gray, cv.COLOR_RGBA2GRAY);
+        cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
 
         blurred = new cv.Mat();
         cv.GaussianBlur(gray, blurred, new cv.Size(5, 5), 0);
 
-        // 3. Edge Detection
+        // 2. Edge Detection
         edges = new cv.Mat();
         cv.Canny(blurred, edges, 50, 150);
 
-        // 4. HoughLinesP for Edge Reconstruction
-        const lines = new cv.Mat();
-        cv.HoughLinesP(edges, lines, 1, Math.PI / 180, 50, 50, 10);
+        // 3. Fine Tune: Refine edges with HoughLinesP (Requirement)
+        lines = new cv.Mat();
+        cv.HoughLinesP(edges, lines, 1, Math.PI / 180, 40, 30, 10);
 
-        // Simple approach: find intersection of 4 strongest lines or fallback to contours
-        // For robustness in this implementation, we will continue with contour finding but 
-        // focus on reconstructable edges via Hough if needed. 
-        // Actually, the requirement says "Use HoughLinesP to reconstruct edges".
-        
-        contours = new cv.MatVector();
-        hierarchy = new cv.Mat();
-        cv.findContours(edges, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+        if (currentTier === 'low') {
+            contours = new cv.MatVector();
+            hierarchy = new cv.Mat();
+            cv.findContours(edges, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
 
-        let maxArea = 0;
-        let bestApprox = new cv.Mat();
-        let found = false;
+            let maxArea = 0;
+            let bestApprox = new cv.Mat();
+            let found = false;
 
-        for (let i = 0; i < contours.size(); ++i) {
-            const cnt = contours.get(i);
-            const area = cv.contourArea(cnt);
-            if (area > (rw * rh * 0.2)) { // At least 20% of ROI
-                const peri = cv.arcLength(cnt, true);
-                const approx = new cv.Mat();
-                cv.approxPolyDP(cnt, approx, 0.02 * peri, true);
+            for (let i = 0; i < contours.size(); ++i) {
+                const cnt = contours.get(i);
+                const area = cv.contourArea(cnt);
+                if (area > (rw * rh * 0.2)) {
+                    const peri = cv.arcLength(cnt, true);
+                    const approx = new cv.Mat();
+                    cv.approxPolyDP(cnt, approx, 0.02 * peri, true);
 
-                if (approx.rows === 4) {
-                    if (area > maxArea) {
-                        maxArea = area;
-                        if (found) bestApprox.delete();
-                        bestApprox = approx;
-                        found = true;
+                    if (approx.rows === 4) {
+                        if (area > maxArea) {
+                            maxArea = area;
+                            if (found) bestApprox.delete();
+                            bestApprox = approx;
+                            found = true;
+                        } else {
+                            approx.delete();
+                        }
                     } else {
                         approx.delete();
                     }
-                } else {
-                    approx.delete();
+                }
+                cnt.delete();
+            }
+
+            if (found) {
+                const pts = [];
+                for (let i = 0; i < 4; i++) {
+                    pts.push({ x: bestApprox.data32S[i * 2], y: bestApprox.data32S[i * 2 + 1] });
+                }
+                bestApprox.delete();
+
+                pts.sort((a, b) => (a.x + a.y) - (b.x + b.y));
+                const tl = pts[0];
+                const br = pts[3];
+                const rem = [pts[1], pts[2]];
+                rem.sort((a, b) => (a.y - a.x) - (b.y - b.x));
+                const tr = rem[0];
+                const bl = rem[1];
+
+                const maxWidth = Math.max(Math.hypot(br.x - bl.x, br.y - bl.y), Math.hypot(tr.x - tl.x, tr.y - tl.y));
+                const maxHeight = Math.max(Math.hypot(tr.x - br.x, tr.y - br.y), Math.hypot(tl.x - bl.x, tl.y - bl.y));
+
+                const ratio = maxWidth / maxHeight;
+                if (Math.abs(ratio - CONFIG.ID_ASPECT_RATIO) < CONFIG.ID_ASPECT_TOLERANCE ||
+                    Math.abs((1 / ratio) - CONFIG.ID_ASPECT_RATIO) < CONFIG.ID_ASPECT_TOLERANCE) {
+                    return { isStable: true, tightBox: { x: tl.x, y: tl.y, width: maxWidth, height: maxHeight } };
                 }
             }
-            cnt.delete();
+        } else {
+            // Tier 1: High Precision with HoughLinesP Corner Solving
+            if (lines.rows >= 4) {
+                let horizontalLines = [];
+                let verticalLines = [];
+
+                for (let i = 0; i < lines.rows; ++i) {
+                    const [x1, y1, x2, y2] = lines.data32S.slice(i * 4, i * 4 + 4);
+                    const angle = Math.abs(Math.atan2(y2 - y1, x2 - x1) * 180 / Math.PI);
+
+                    if (angle < 20 || angle > 160) {
+                        horizontalLines.push({ y: (y1 + y2) / 2, x1, x2 });
+                    } else if (Math.abs(angle - 90) < 20) {
+                        verticalLines.push({ x: (x1 + x2) / 2, y1, y2 });
+                    }
+                }
+
+                if (horizontalLines.length >= 2 && verticalLines.length >= 2) {
+                    horizontalLines.sort((a, b) => a.y - b.y);
+                    verticalLines.sort((a, b) => a.x - b.x);
+
+                    const top = horizontalLines[0].y;
+                    const bottom = horizontalLines[horizontalLines.length - 1].y;
+                    const left = verticalLines[0].x;
+                    const right = verticalLines[verticalLines.length - 1].x;
+
+                    const w = right - left;
+                    const h = bottom - top;
+                    const ratio = w / h;
+
+                    if (Math.abs(ratio - CONFIG.ID_ASPECT_RATIO) < CONFIG.ID_ASPECT_TOLERANCE ||
+                        Math.abs((1 / ratio) - CONFIG.ID_ASPECT_RATIO) < CONFIG.ID_ASPECT_TOLERANCE) {
+                        return { isStable: true, tightBox: { x: left, y: top, width: w, height: h } };
+                    }
+                }
+            }
+            return { isStable: true, tightBox: yoloBoxInRoi };
         }
 
-        if (found) {
-            const pts = [];
-            for (let i = 0; i < 4; i++) {
-                pts.push({ x: bestApprox.data32S[i * 2], y: bestApprox.data32S[i * 2 + 1] });
-            }
-            
-            // Hough correction (optional: adjust points based on nearest Hough lines)
-            // For now, satisfy the "Uses HoughLinesP" by having the computation present 
-            // and logging it as a refinement step.
-            if (lines.rows > 4) {
-                console.log(`[Worker] HoughLinesP found ${lines.rows} lines for refinement.`);
-            }
-            lines.delete();
-
-            // Sort by sum...
-            pts.sort((a, b) => (a.x + a.y) - (b.x + b.y));
-            const tl = pts[0];
-            const br = pts[3];
-            const rem = [pts[1], pts[2]];
-            rem.sort((a, b) => (a.y - a.x) - (b.y - b.x));
-            const tr = rem[0];
-            const bl = rem[1];
-
-            const widthA = Math.hypot(br.x - bl.x, br.y - bl.y);
-            const widthB = Math.hypot(tr.x - tl.x, tr.y - tl.y);
-            const maxWidth = Math.max(widthA, widthB);
-            const heightA = Math.hypot(tr.x - br.x, tr.y - br.y);
-            const heightB = Math.hypot(tl.x - bl.x, tl.y - bl.y);
-            const maxHeight = Math.max(heightA, heightB);
-
-            const ratio = maxWidth / maxHeight;
-            const isHorizontal = Math.abs(ratio - 1.58) < 0.3;
-            const isVertical = Math.abs((1 / ratio) - 1.58) < 0.3;
-
-            if (isHorizontal || isVertical) {
-                const imgData = new ImageData(new Uint8ClampedArray(frameData), width, height);
-                const tightBox = { x: rx, y: ry, width: rw, height: rh }; // Using ROI for now
-                bestApprox.delete();
-                return { imgData, isStable: true, tightBox };
-            }
-            bestApprox.delete();
-        }
-        if (lines) lines.delete();
-
-        return { imgData: null, isStable: false };
+        return { isStable: false };
 
     } catch (err) {
         console.error("[Worker] OpenCV Processing Error:", err);
-        return { imgData: null, isStable: false };
+        return { isStable: false };
     } finally {
         if (src) src.delete();
-        if (roi) roi.delete();
         if (gray) gray.delete();
         if (blurred) blurred.delete();
         if (edges) edges.delete();
+        if (lines) lines.delete();
         if (contours) contours.delete();
         if (hierarchy) hierarchy.delete();
-        if (warped) warped.delete();
     }
 }
 
@@ -489,227 +526,358 @@ self.onmessage = async (e: MessageEvent) => {
         forceNextCapture = true;
         return;
     }
-    const { type, frameData, width, height, stage, tier } = e.data;
+    const { type, bitmap, width, height, stage, tier } = e.data;
 
     if (type === 'INIT') {
         await initModels(tier);
+        self.postMessage({
+            type: 'STATUS',
+            feedback: yoloModel ? "System Ready" : "System Ready (Simulated)",
+            isMocking: !yoloModel
+        });
         return;
     }
 
-    if (stage === KYCStage.PRE_FLIGHT) {
-        let brightnessSum = 0;
-        let pixelCount = 0;
+    if (!bitmap && type !== 'INIT') return;
 
-        // Calculate true relative luminance (Grayscale)
-        for (let i = 0; i < frameData.length; i += 16) {
-            const r = frameData[i];
-            const g = frameData[i + 1];
-            const b = frameData[i + 2];
-            const luminance = 0.299 * r + 0.587 * g + 0.114 * b;
-            brightnessSum += luminance;
-            pixelCount++;
+    try {
+        // Helper to get ImageData from bitmap (used for Pre-Flight and Face)
+        const getImageData = (bmp: ImageBitmap, w: number, h: number): ImageData => {
+            if (!offscreenCanvas || offscreenCanvas.width !== w || offscreenCanvas.height !== h) {
+                offscreenCanvas = new OffscreenCanvas(w, h);
+                offscreenCtx = offscreenCanvas.getContext('2d', { willReadFrequently: true });
+            }
+            offscreenCtx!.drawImage(bmp, 0, 0);
+            return offscreenCtx!.getImageData(0, 0, w, h);
+        };
+
+        if (stage === KYCStage.PRE_FLIGHT) {
+            const imageData = getImageData(bitmap, width, height);
+            const frameData = imageData.data;
+            let brightnessSum = 0;
+            let pixelCount = 0;
+
+            for (let i = 0; i < frameData.length; i += 16) {
+                const r = frameData[i];
+                const g = frameData[i + 1];
+                const b = frameData[i + 2];
+                const luminance = 0.299 * r + 0.587 * g + 0.114 * b;
+                brightnessSum += luminance;
+                pixelCount++;
+            }
+            const meanBrightness = brightnessSum / pixelCount;
+
+            if (meanBrightness < CONFIG.MIN_BRIGHTNESS) {
+                return self.postMessage({ type: 'FRAME_RESULT', stage, feedback: "Too dark. Move to a well-lit area.", isReady: false });
+            }
+            if (meanBrightness > CONFIG.MAX_BRIGHTNESS) {
+                return self.postMessage({ type: 'FRAME_RESULT', stage, feedback: "Too bright. Avoid direct glare.", isReady: false });
+            }
+
+            const variance = getLaplacianVariance(frameData, width, height);
+            if (variance < CONFIG.MIN_GLOBAL_VARIANCE) {
+                return self.postMessage({ type: 'FRAME_RESULT', stage, feedback: "Camera blurry. Clean your lens.", isReady: false });
+            }
+
+            self.postMessage({ type: 'FRAME_RESULT', stage, feedback: "Environment optimal.", isReady: true });
         }
-        const meanBrightness = brightnessSum / pixelCount;
 
-        if (meanBrightness < CONFIG.MIN_BRIGHTNESS) {
-            console.log(`[Pre-Flight] Failed: Too dark (${Math.round(meanBrightness)})`);
-            return self.postMessage({ type: 'FRAME_RESULT', stage, feedback: "Too dark. Move to a well-lit area.", isReady: false });
-        }
-        if (meanBrightness > CONFIG.MAX_BRIGHTNESS) {
-            console.log(`[Pre-Flight] Failed: Too bright (${Math.round(meanBrightness)})`);
-            return self.postMessage({ type: 'FRAME_RESULT', stage, feedback: "Too bright. Avoid direct glare.", isReady: false });
-        }
+        else if (stage === KYCStage.ID_CAPTURE) {
+            let boundingBox = null;
+            let feedback = yoloModel ? "Show your ID card to the camera." : "Simulating ID detector...";
+            let isReady = false;
+            let capturedImage = null;
 
-        const variance = getLaplacianVariance(frameData, width, height);
-        if (variance < CONFIG.MIN_GLOBAL_VARIANCE) {
-            console.log(`[Pre-Flight] Failed: Blurry lens (Variance: ${Math.round(variance)})`);
-            return self.postMessage({ type: 'FRAME_RESULT', stage, feedback: "Camera blurry. Clean your lens.", isReady: false });
-        }
+            if (yoloModel) {
+                try {
+                    // --- LETTERBOX: pad the 16:9 frame to a square so YOLO sees undistorted geometry ---
+                    // Direct resize to 640×640 compresses horizontal pixels ~3× more than vertical,
+                    // producing degenerate boxes (a thin strip) when the card fills the frame.
+                    const lbMaxDim = Math.max(width, height);
+                    const lbPadTop = Math.floor((lbMaxDim - height) / 2);
+                    const lbPadLeft = Math.floor((lbMaxDim - width) / 2);
+                    const lbPadBottom = lbMaxDim - height - lbPadTop;
+                    const lbPadRight = lbMaxDim - width - lbPadLeft;
+                    const lbScale = lbMaxDim / CONFIG.YOLO_SIZE; // original pixels per YOLO pixel
 
-        console.log(`[Pre-Flight] Passed. Brightness: ${Math.round(meanBrightness)}, Variance: ${Math.round(variance)}`);
-        self.postMessage({ type: 'FRAME_RESULT', stage, feedback: "Environment optimal.", isReady: true });
-    }
+                    const { boxes, maxScores, maxIdxTensor, debugShape, numClasses } = tf.tidy(() => {
+                        // 1. Convert to Tensor (Optimized for WebGL/WASM)
+                        const imgTensor = tf.browser.fromPixels(bitmap) as tf.Tensor3D;
 
-    else if (stage === KYCStage.ID_CAPTURE) {
-        let boundingBox = null;
-        let feedback = yoloModel ? "Show your ID card to the camera." : "Simulating ID detector...";
-        let isReady = false;
-        let capturedImage = null;
+                        // 2. Letterbox-pad to square, then resize — preserves aspect ratio
+                        const padded = tf.pad(imgTensor, [[lbPadTop, lbPadBottom], [lbPadLeft, lbPadRight], [0, 0]], 114);
+                        const resized = tf.image.resizeBilinear(padded as tf.Tensor3D, [CONFIG.YOLO_SIZE, CONFIG.YOLO_SIZE]);
+                        const input = resized.expandDims(0).div(255.0);
 
-        if (yoloModel) {
-            try {
-                const { boxes, maxScores, maxIdxTensor, debugShape } = tf.tidy(() => {
-                    // 1. Convert incoming buffer to Tensor
-                    const pixels = new Uint8Array(frameData);
-                    const imgTensor = tf.tensor3d(pixels, [height, width, 4], 'int32');
+                        // 3. Execute model
+                        let res = yoloModel!.execute(input);
+                        if (Array.isArray(res)) res = res[0];
+                        let tensor = res as tf.Tensor;
+                        let shape = tensor.shape;
 
-                    // 2. Preprocess for YOLO
-                    const rgb = imgTensor.slice([0, 0, 0], [-1, -1, 3]) as tf.Tensor3D;
-                    const resized = tf.image.resizeBilinear(rgb, [640, 640]);
-                    const input = resized.expandDims(0).div(255.0);
-
-                    // 3. Execute model
-                    let res = yoloModel!.execute(input);
-
-                    // If model returns an array of outputs, take the first one
-                    if (Array.isArray(res)) res = res[0];
-                    let tensor = res as tf.Tensor;
-                    let shape = tensor.shape;
-
-                    let finalBoxes, finalScores;
-
-                    // 4. Handle dynamic tensor shapes (Transposing if necessary)
-                    // Some models export[1, 84, 8400], others [1, 8400, 84]
-                    if (shape[1]! > shape[2]!) {
-                        tensor = tensor.transpose([0, 2, 1]); // Convert [1, 8400, 84] to[1, 84, 8400]
-                        shape = tensor.shape;
-                    }
-
-                    const numRows = shape[1]!;
-                    const numBoxes = shape[2]!;
-                    const numClasses = numRows - 4;
-
-                    // 5. Slice coordinates and scores safely
-                    finalBoxes = tensor.slice([0, 0, 0], [1, 4, numBoxes]);
-                    finalScores = tensor.slice([0, 4, 0], [1, numClasses, numBoxes]);
-
-                    // Ignore class 0 (person) to prevent detecting the user's face as an ID card
-                    const nonPersonScores = finalScores.slice([0, 1, 0], [1, numClasses - 1, numBoxes]);
-                    const maxScores = nonPersonScores.max(1);
-                    const maxIdxTensor = maxScores.argMax(1);
-
-                    return { boxes: finalBoxes, maxScores, maxIdxTensor, debugShape: shape };
-                });
-
-                // Pull data back to Javascript synchronously
-                const [boxesData, scoresData, idxData] = await Promise.all([
-                    boxes.data(), maxScores.data(), maxIdxTensor.data()
-                ]);
-
-                // Free GPU memory manually for safety
-                tf.dispose([boxes, maxScores, maxIdxTensor]);
-
-                const maxIdx = idxData[0];
-                const score = scoresData[maxIdx];
-
-                // Debug print (1 in 30 frames to avoid console flood)
-                if (Math.random() < 0.03) {
-                    console.log(`[Worker - YOLO] Tensor Shape: [${debugShape}] | Max Conf: ${(score * 100).toFixed(1)}%`);
-                }
-
-                if (score > CONFIG.YOLO_CONFIDENCE) {
-                    const cx = (boxesData[maxIdx] / 640) * width;
-                    const cy = (boxesData[debugShape[2]! + maxIdx] / 640) * height;
-                    const w = (boxesData[debugShape[2]! * 2 + maxIdx] / 640) * width;
-                    const h = (boxesData[debugShape[2]! * 3 + maxIdx] / 640) * height;
-
-                    // Adjust the bounding box size based on configuration
-                    const expandFactor = CONFIG.ID_BOX_EXPAND_FACTOR;
-                    const adjW = w * expandFactor;
-                    const adjH = h * expandFactor;
-
-                    boundingBox = { x: cx - adjW / 2, y: cy - adjH / 2, width: adjW, height: adjH };
-
-                    const ratio = w / h;
-                    const isHorizontal = Math.abs(ratio - CONFIG.ID_ASPECT_RATIO) < CONFIG.ID_ASPECT_TOLERANCE;
-                    const isVertical = Math.abs(ratio - (1 / CONFIG.ID_ASPECT_RATIO)) < CONFIG.ID_ASPECT_TOLERANCE;
-                    const distToCenter = Math.sqrt(Math.pow(cx - width / 2, 2) + Math.pow(cy - height / 2, 2));
-
-                    if (!isHorizontal && !isVertical) {
-                        feedback = "Align ID directly to the frame.";
-                        captureTimer = 0;
-                    } else if (distToCenter > width * CONFIG.ID_MAX_DIST_CENTER || w < width * CONFIG.ID_MIN_WIDTH_RATIO) {
-                        feedback = "Center and bring the ID closer.";
-                        captureTimer = 0;
-                    } else {
-                        let warpedImageData = null;
-                        if (cv) {
-                            const cvResult = processIDCardOpenCV(frameData, width, height, boundingBox);
-                            if (cvResult && cvResult.isStable) {
-                                warpedImageData = cvResult.imgData;
-                                if (cvResult.tightBox) {
-                                    boundingBox = cvResult.tightBox; // Snap bounding box strictly to OpenCV contour
-                                }
-                            }
+                        if (shape[1]! > shape[2]!) {
+                            tensor = tensor.transpose([0, 2, 1]);
+                            shape = tensor.shape;
                         }
 
-                        if (warpedImageData) {
-                            // Even with OpenCV, we must verify the crop isn't blurry
-                            const variance = getLaplacianVariance(frameData, width, height, { x: boundingBox.x, y: boundingBox.y, w: boundingBox.width, h: boundingBox.height });
+                        const numRows = shape[1]!;
+                        const numBoxes = shape[2]!;
+                        const numClasses = numRows - 4;
 
-                            // Check bounding box stability
-                            let isStableBox = true;
-                            if (previousBoundingBox) {
-                                const dx = Math.abs(boundingBox.x - previousBoundingBox.x);
-                                const dy = Math.abs(boundingBox.y - previousBoundingBox.y);
-                                const dw = Math.abs(boundingBox.width - previousBoundingBox.width);
-                                const dh = Math.abs(boundingBox.height - previousBoundingBox.height);
-                                if (dx > width * CONFIG.ID_STABILITY_TOLERANCE || dy > height * CONFIG.ID_STABILITY_TOLERANCE || dw > width * CONFIG.ID_STABILITY_TOLERANCE || dh > height * CONFIG.ID_STABILITY_TOLERANCE) {
-                                    isStableBox = false;
-                                }
-                            }
-                            previousBoundingBox = boundingBox;
+                        const finalBoxes = tensor.slice([0, 0, 0], [1, 4, numBoxes]);
+                        const finalScores = tensor.slice([0, 4, 0], [1, numClasses, numBoxes]);
 
-                            if (variance < CONFIG.ID_MIN_VARIANCE || !isStableBox) { // Very strict blur check + stability check
-                                feedback = !isStableBox ? "Hold ID still." : "ID is blurry. Hold steady.";
-                                isReady = false;
-                                captureTimer = 0;
+                        // Skip class 0 (person) to prevent the user's face being mistaken for an ID card
+                        const nonPersonScores = numClasses > 1
+                            ? finalScores.slice([0, 1, 0], [1, numClasses - 1, numBoxes])
+                            : finalScores;
+                        const maxScores = nonPersonScores.max(1);
+                        const maxIdxTensor = maxScores.argMax(1);
+
+                        return { boxes: finalBoxes, maxScores, maxIdxTensor, debugShape: shape, numClasses };
+                    });
+
+                    const [boxesData, scoresData, idxData] = await Promise.all([
+                        boxes.data(), maxScores.data(), maxIdxTensor.data()
+                    ]);
+
+                    tf.dispose([boxes, maxScores, maxIdxTensor]);
+
+                    const maxIdx = idxData[0];
+                    const score = scoresData[maxIdx];
+
+                    if (score > 0.05) {
+                        console.log(`[Worker] YOLO Best: Score=${score.toFixed(2)}, BoxIdx=${maxIdx}, Classes=${numClasses}`);
+                    }
+
+                    // Always recover coordinates when there's any signal. Even a low-confidence
+                    // detection is useful for close-up frames where YOLO loses background context.
+                    if (score > 0.03) {
+                        // --- LETTERBOX-AWARE coordinate recovery ---
+                        // Convert YOLO-space (0-640 or normalized 0-1) back to original frame coords
+                        // using the letterbox scale and padding offsets.
+                        const rawW = boxesData[debugShape[2]! * 2 + maxIdx];
+                        const isNormalized = rawW <= 1.1;
+
+                        let cx: number, cy: number, w: number, h: number;
+                        if (isNormalized) {
+                            cx = boxesData[maxIdx] * lbMaxDim - lbPadLeft;
+                            cy = boxesData[debugShape[2]! + maxIdx] * lbMaxDim - lbPadTop;
+                            w  = boxesData[debugShape[2]! * 2 + maxIdx] * lbMaxDim;
+                            h  = boxesData[debugShape[2]! * 3 + maxIdx] * lbMaxDim;
+                        } else {
+                            cx = boxesData[maxIdx] * lbScale - lbPadLeft;
+                            cy = boxesData[debugShape[2]! + maxIdx] * lbScale - lbPadTop;
+                            w  = boxesData[debugShape[2]! * 2 + maxIdx] * lbScale;
+                            h  = boxesData[debugShape[2]! * 3 + maxIdx] * lbScale;
+                        }
+
+                        // --- CLOSE-UP DETECTION ---
+                        // When the card is close it fills the frame; YOLO loses background context
+                        // and confidence drops well below YOLO_CONFIDENCE. Check the box size first
+                        // and bypass the confidence gate so close-up captures still work.
+                        const cardFillsFrame = w >= width * 0.65 || h >= height * 0.65;
+                        let proceedToQualityCheck = false;
+
+                        if (cardFillsFrame) {
+                            const inset = Math.min(width, height) * 0.02;
+                            const rawBox = { x: inset, y: inset, width: width - inset * 2, height: height - inset * 2 };
+                            smoothedBoundingBox = applyEMA(smoothedBoundingBox, rawBox);
+                            boundingBox = smoothedBoundingBox;
+                            proceedToQualityCheck = true;
+                        } else if (score > CONFIG.YOLO_CONFIDENCE) {
+                            const adjW = w * CONFIG.ID_BOX_EXPAND_FACTOR;
+                            const adjH = h * CONFIG.ID_BOX_EXPAND_FACTOR;
+
+                            // Apply EMA smoothing to raw YOLO box before any quality checks
+                            const rawBox = { x: cx - adjW / 2, y: cy - adjH / 2, width: adjW, height: adjH };
+                            smoothedBoundingBox = applyEMA(smoothedBoundingBox, rawBox);
+                            boundingBox = smoothedBoundingBox;
+
+                            const ratio = w / h;
+                            const isHorizontal = Math.abs(ratio - CONFIG.ID_ASPECT_RATIO) < CONFIG.ID_ASPECT_TOLERANCE;
+                            const isVertical = Math.abs(ratio - (1 / CONFIG.ID_ASPECT_RATIO)) < CONFIG.ID_ASPECT_TOLERANCE;
+                            const distToCenter = Math.sqrt(Math.pow(cx - width / 2, 2) + Math.pow(cy - height / 2, 2));
+
+                            if (!isHorizontal && !isVertical) {
+                                feedback = "Align ID directly to the frame.";
+                                captureTimer = Math.max(0, captureTimer - 2);
+                            } else if (w < width * CONFIG.ID_MIN_WIDTH_RATIO) {
+                                feedback = "Bring the ID closer to the camera.";
+                                captureTimer = Math.max(0, captureTimer - 2);
+                            } else if (distToCenter > width * CONFIG.ID_MAX_DIST_CENTER) {
+                                feedback = "Center the ID in the frame.";
+                                captureTimer = Math.max(0, captureTimer - 2);
                             } else {
-                                feedback = "Perfect. Hold steady...";
-                                isReady = true;
-                                captureTimer++;
-                                if (captureTimer > CONFIG.ID_CAPTURE_FRAMES) { // Increased to 10 frames for absolute stability
-                                    capturedImage = await captureWarpedImage(warpedImageData);
-                                    captureTimer = 0;
-                                }
+                                proceedToQualityCheck = true;
                             }
                         } else {
-                            // Fallback to Laplacian variance if OpenCV fails to find perfect corners
-                            const variance = getLaplacianVariance(frameData, width, height, { x: boundingBox.x, y: boundingBox.y, w: boundingBox.width, h: boundingBox.height });
+                            // Low confidence and card is not close enough — no useful detection
+                            captureTimer = Math.max(0, captureTimer - 1);
+                            smoothedBoundingBox = null;
+                        }
 
-                            // Check bounding box stability
-                            let isStableBox = true;
-                            if (previousBoundingBox) {
-                                const dx = Math.abs(boundingBox.x - previousBoundingBox.x);
-                                const dy = Math.abs(boundingBox.y - previousBoundingBox.y);
-                                const dw = Math.abs(boundingBox.width - previousBoundingBox.width);
-                                const dh = Math.abs(boundingBox.height - previousBoundingBox.height);
-                                if (dx > width * CONFIG.ID_STABILITY_TOLERANCE || dy > height * CONFIG.ID_STABILITY_TOLERANCE || dw > width * CONFIG.ID_STABILITY_TOLERANCE || dh > height * CONFIG.ID_STABILITY_TOLERANCE) {
-                                    isStableBox = false;
+                        if (proceedToQualityCheck) {
+                            if (cv) {
+                                // Extract ROI using dedicated roiCanvas to avoid thrashing offscreenCanvas dimensions
+                                const rx = Math.max(0, Math.floor(boundingBox!.x - boundingBox!.width * 0.15));
+                                const ry = Math.max(0, Math.floor(boundingBox!.y - boundingBox!.height * 0.15));
+                                const rw = Math.min(width - rx, Math.floor(boundingBox!.width * 1.3));
+                                const rh = Math.min(height - ry, Math.floor(boundingBox!.height * 1.3));
+
+                                if (!roiCanvas || roiCanvas.width !== rw || roiCanvas.height !== rh) {
+                                    roiCanvas = new OffscreenCanvas(rw, rh);
+                                    roiCtx = roiCanvas.getContext('2d', { willReadFrequently: true });
                                 }
-                            }
-                            previousBoundingBox = boundingBox;
+                                roiCtx!.drawImage(bitmap, rx, ry, rw, rh, 0, 0, rw, rh);
+                                const roiData = roiCtx!.getImageData(0, 0, rw, rh);
 
-                            if (variance < CONFIG.ID_MIN_VARIANCE || !isStableBox) { // Very strict blur check + stability check
-                                feedback = !isStableBox ? "Hold ID still." : "ID is blurry. Hold steady.";
-                                isReady = false;
-                                captureTimer = 0;
+                                const cvResult = processIDCardOpenCV(roiData.data, rw, rh, { x: boundingBox!.x - rx, y: boundingBox!.y - ry, width: boundingBox!.width, height: boundingBox!.height });
+                                if (cvResult && cvResult.isStable && cvResult.tightBox) {
+                                    // Apply EMA to the refined OpenCV box as well
+                                    const refined = {
+                                        x: cvResult.tightBox.x + rx,
+                                        y: cvResult.tightBox.y + ry,
+                                        width: cvResult.tightBox.width,
+                                        height: cvResult.tightBox.height
+                                    };
+                                    smoothedBoundingBox = applyEMA(smoothedBoundingBox, refined);
+                                    boundingBox = smoothedBoundingBox;
+                                }
+
+                                const variance = getLaplacianVariance(roiData.data, rw, rh, { x: boundingBox!.x - rx, y: boundingBox!.y - ry, w: boundingBox!.width, h: boundingBox!.height });
+
+                                let isStableBox = true;
+                                if (previousBoundingBox) {
+                                    const dx = Math.abs(boundingBox!.x - previousBoundingBox.x);
+                                    const dy = Math.abs(boundingBox!.y - previousBoundingBox.y);
+                                    if (dx > width * CONFIG.ID_STABILITY_TOLERANCE || dy > height * CONFIG.ID_STABILITY_TOLERANCE) {
+                                        isStableBox = false;
+                                    }
+                                }
+                                previousBoundingBox = { ...boundingBox! };
+
+                                if (variance < CONFIG.ID_MIN_VARIANCE || !isStableBox) {
+                                    feedback = !isStableBox ? "Hold ID still." : "ID is blurry. Hold steady.";
+                                    isReady = false;
+                                    // Soft decay — a single bad frame won't restart the full countdown
+                                    captureTimer = Math.max(0, captureTimer - 2);
+                                } else {
+                                    feedback = "Perfect. Hold steady...";
+                                    isReady = true;
+                                    captureTimer++;
+                                    if (captureTimer > CONFIG.ID_CAPTURE_FRAMES) {
+                                        // Full-frame capture using the stable offscreenCanvas
+                                        if (!offscreenCanvas || offscreenCanvas.width !== width || offscreenCanvas.height !== height) {
+                                            offscreenCanvas = new OffscreenCanvas(width, height);
+                                            offscreenCtx = offscreenCanvas.getContext('2d', { willReadFrequently: true });
+                                        }
+                                        offscreenCtx!.drawImage(bitmap, 0, 0);
+                                        const fullFrameData = offscreenCtx!.getImageData(0, 0, width, height);
+                                        capturedImage = await captureImage(fullFrameData.data, width, height, boundingBox!);
+                                        captureTimer = 0;
+                                    }
+                                }
                             } else {
-                                feedback = "Perfect. Hold steady...";
-                                isReady = true;
-                                captureTimer++;
-                                if (captureTimer > CONFIG.ID_CAPTURE_FRAMES) { // Increased to 10 frames
-                                    capturedImage = await captureImage(frameData, width, height, boundingBox);
-                                    captureTimer = 0;
-                                }
+                                // OpenCV not yet loaded — show status so the UI isn't silently frozen
+                                feedback = "Optimizing detection...";
+                                captureTimer = 0;
+                            }
+                        }
+                    } else {
+                        // No YOLO signal at all — decay timer
+                        captureTimer = Math.max(0, captureTimer - 1);
+                        smoothedBoundingBox = null;
+                    }
+                } catch (err) {
+                    console.error("[Worker] YOLO Crash Intercepted: ", err);
+                    feedback = "Analyzing ID...";
+                }
+            } else {
+                // FALLBACK ID DETECTION (Using bitmap)
+                const imageData = getImageData(bitmap, width, height);
+                const frameData = imageData.data;
+                let faceBox = null;
+                if (faceLandmarker) {
+                    try {
+                        const results = faceLandmarker.detect(imageData);
+                        if (results.faceLandmarks && results.faceLandmarks.length > 0) {
+                            const landmarks = results.faceLandmarks[0];
+                            let minX = width, minY = height, maxX = 0, maxY = 0;
+                            landmarks.forEach((l: { x: number; y: number }) => {
+                                const x = l.x * width; const y = l.y * height;
+                                if (x < minX) minX = x; if (x > maxX) maxX = x;
+                                if (y < minY) minY = y; if (y > maxY) maxY = y;
+                            });
+                            const padX = (maxX - minX) * 0.25;
+                            const padY = (maxY - minY) * 0.25;
+                            faceBox = { x: minX - padX, y: minY - padY, w: (maxX - minX) + padX * 2, h: (maxY - minY) + padY * 2 };
+                        }
+                    } catch (e) {
+                        console.error("[Worker] FaceLandmarker error during ID capture:", e);
+                    }
+                }
+
+                const box = findIDCardBoundingBox(frameData, width, height, faceBox);
+
+                if (!box) {
+                    feedback = faceBox ? "Face detected. Please show only the ID card." : "Show your ID card to the camera.";
+                    isReady = false;
+                    captureTimer = 0;
+                    boundingBox = null;
+                    smoothedBoundingBox = null;
+                } else {
+                    boundingBox = box;
+                    const ratio = box.width / box.height;
+                    const isHorizontal = Math.abs(ratio - CONFIG.ID_ASPECT_RATIO) < CONFIG.ID_ASPECT_TOLERANCE;
+                    const isVertical = Math.abs(ratio - (1 / CONFIG.ID_ASPECT_RATIO)) < CONFIG.ID_ASPECT_TOLERANCE;
+
+                    const isCutOff = box.x <= 0 || box.y <= 0 || (box.x + box.width) >= width || (box.y + box.height) >= height;
+
+                    if (isCutOff && (box.width > width * 0.9 || box.height > height * 0.9)) {
+                        feedback = "Center the ID in the frame.";
+                        captureTimer = 0;
+                        isReady = false;
+                    } else if (!isHorizontal && !isVertical) {
+                        feedback = "Align ID directly to the frame.";
+                        captureTimer = 0;
+                        isReady = false;
+                    } else {
+                        const variance = getLaplacianVariance(frameData, width, height, { x: box.x, y: box.y, w: box.width, h: box.height });
+
+                        if (variance < CONFIG.MIN_GLOBAL_VARIANCE) {
+                            feedback = "ID is blurry. Hold steady.";
+                            isReady = false;
+                            captureTimer = 0;
+                        } else {
+                            feedback = "Perfect. Hold steady...";
+                            isReady = true;
+                            captureTimer++;
+                            if (captureTimer > CONFIG.ID_CAPTURE_FRAMES) {
+                                capturedImage = await captureImage(frameData, width, height);
+                                captureTimer = 0;
                             }
                         }
                     }
-                } else {
-                    captureTimer = 0;
                 }
-            } catch (err) {
-                console.error("[Worker] YOLO Crash Intercepted: ", err);
-                feedback = "Analyzing ID...";
             }
-        } else {
-            // FALLBACK ID DETECTION
-            let faceBox = null;
+
+            const progress = isReady ? Math.min(1, captureTimer / CONFIG.ID_CAPTURE_FRAMES) : 0;
+            self.postMessage({ type: 'FRAME_RESULT', stage, feedback: debounceFeedback(feedback), isReady, boundingBox, capturedImage, isMocking: false, progress });
+        }
+
+        else if (stage === KYCStage.FACE_CAPTURE) {
+            const imageData = getImageData(bitmap, width, height);
+            const frameData = imageData.data;
+            let feedback = faceLandmarker ? "Center your face." : "Loading face detector...";
+            let isReady = false;
+            let capturedImage = null;
+            let boundingBox = null;
+
             if (faceLandmarker) {
                 try {
-                    const imageDataArray = frameData instanceof Uint8ClampedArray ? frameData : new Uint8ClampedArray(frameData);
-                    const imageData = new ImageData(imageDataArray, width, height);
                     const results = faceLandmarker.detect(imageData);
+
                     if (results.faceLandmarks && results.faceLandmarks.length > 0) {
                         const landmarks = results.faceLandmarks[0];
                         let minX = width, minY = height, maxX = 0, maxY = 0;
@@ -720,178 +888,96 @@ self.onmessage = async (e: MessageEvent) => {
                         });
                         const padX = (maxX - minX) * 0.25;
                         const padY = (maxY - minY) * 0.25;
-                        faceBox = { x: minX - padX, y: minY - padY, w: (maxX - minX) + padX * 2, h: (maxY - minY) + padY * 2 };
-                    }
-                } catch (e) {
-                    console.error("[Worker] FaceLandmarker error during ID capture:", e);
-                }
-            }
+                        boundingBox = { x: minX - padX, y: minY - padY, width: (maxX - minX) + padX * 2, height: (maxY - minY) + padY * 2 };
 
-            const box = findIDCardBoundingBox(frameData, width, height, faceBox);
+                        const faceWidthRatio = boundingBox.width / width;
+                        const faceCenterX = boundingBox.x + (boundingBox.width / 2);
+                        const faceCenterY = boundingBox.y + (boundingBox.height / 2);
+                        const isCentered = Math.abs(faceCenterX - width / 2) < width * CONFIG.FACE_CENTER_TOLERANCE && Math.abs(faceCenterY - height / 2) < height * CONFIG.FACE_CENTER_TOLERANCE;
 
-            if (!box) {
-                if (faceBox) {
-                    feedback = "Face detected. Please show only the ID card.";
-                } else {
-                    feedback = "Show your ID card to the camera.";
-                }
-                isReady = false;
-                captureTimer = 0;
-                boundingBox = null;
-            } else {
-                boundingBox = box;
-                const ratio = box.width / box.height;
-                const isHorizontal = Math.abs(ratio - CONFIG.ID_ASPECT_RATIO) < CONFIG.ID_ASPECT_TOLERANCE;
-                const isVertical = Math.abs(ratio - (1 / CONFIG.ID_ASPECT_RATIO)) < CONFIG.ID_ASPECT_TOLERANCE;
-
-                const isCutOff = box.x <= 0 || box.y <= 0 || (box.x + box.width) >= width || (box.y + box.height) >= height;
-
-                if (isCutOff && (box.width > width * 0.9 || box.height > height * 0.9)) {
-                    feedback = "Center the ID in the frame.";
-                    captureTimer = 0;
-                    isReady = false;
-                } else if (!isHorizontal && !isVertical) {
-                    feedback = "Align ID directly to the frame.";
-                    captureTimer = 0;
-                    isReady = false;
-                } else {
-                    const variance = getLaplacianVariance(frameData, width, height, { x: box.x, y: box.y, w: box.width, h: box.height });
-
-                    if (variance < CONFIG.MIN_GLOBAL_VARIANCE) {
-                        feedback = "ID is blurry. Hold steady.";
-                        isReady = false;
-                        captureTimer = 0;
-                    } else {
-                        feedback = "Perfect. Hold steady...";
-                        isReady = true;
-                        captureTimer++;
-                        if (captureTimer > CONFIG.ID_CAPTURE_FRAMES) {
-                            capturedImage = await captureImage(frameData, width, height);
+                        if (!isCentered) {
+                            feedback = "Center your face in the frame.";
                             captureTimer = 0;
-                        }
-                    }
-                }
-            }
-
-            const progress = isReady ? Math.min(1, captureTimer / CONFIG.ID_CAPTURE_FRAMES) : 0;
-            self.postMessage({ type: 'FRAME_RESULT', stage, feedback, isReady, boundingBox, capturedImage, isMocking: false, progress });
-            return;
-        }
-
-        // Always post back to release the Main Thread lock!
-        const progress = isReady ? Math.min(1, captureTimer / CONFIG.ID_CAPTURE_FRAMES) : 0;
-        self.postMessage({ type: 'FRAME_RESULT', stage, feedback, isReady, boundingBox, capturedImage, isMocking: false, progress });
-    }
-
-    else if (stage === KYCStage.FACE_CAPTURE) {
-        let feedback = faceLandmarker ? "Center your face." : "Loading face detector...";
-        let isReady = false;
-        let capturedImage = null;
-        let boundingBox = null;
-
-        if (faceLandmarker) {
-            try {
-                const imageDataArray = frameData instanceof Uint8ClampedArray ? frameData : new Uint8ClampedArray(frameData);
-                const imageData = new ImageData(imageDataArray, width, height);
-                const results = faceLandmarker.detect(imageData);
-
-                if (results.faceLandmarks && results.faceLandmarks.length > 0) {
-                    const landmarks = results.faceLandmarks[0];
-                    let minX = width, minY = height, maxX = 0, maxY = 0;
-                    landmarks.forEach((l: { x: number; y: number }) => {
-                        const x = l.x * width; const y = l.y * height;
-                        if (x < minX) minX = x; if (x > maxX) maxX = x;
-                        if (y < minY) minY = y; if (y > maxY) maxY = y;
-                    });
-                    const padX = (maxX - minX) * 0.25;
-                    const padY = (maxY - minY) * 0.25;
-                    boundingBox = { x: minX - padX, y: minY - padY, width: (maxX - minX) + padX * 2, height: (maxY - minY) + padY * 2 };
-
-                    const faceWidthRatio = boundingBox.width / width;
-                    const faceCenterX = boundingBox.x + (boundingBox.width / 2);
-                    const faceCenterY = boundingBox.y + (boundingBox.height / 2);
-                    const isCentered = Math.abs(faceCenterX - width / 2) < width * CONFIG.FACE_CENTER_TOLERANCE && Math.abs(faceCenterY - height / 2) < height * CONFIG.FACE_CENTER_TOLERANCE;
-
-                    if (!isCentered) {
-                        feedback = "Center your face in the frame.";
-                        captureTimer = 0;
-                    } else if (faceWidthRatio < CONFIG.FACE_MIN_WIDTH_RATIO) {
-                        feedback = "Move your phone closer.";
-                        captureTimer = 0;
-                    } else {
-                        // 1. Eye Openness (EAR)
-                        const lOuter = landmarks[33];
-                        const lInner = landmarks[133];
-                        const lTop = landmarks[159];
-                        const lBottom = landmarks[145];
-                        const lWidth = Math.hypot(lOuter.x - lInner.x, lOuter.y - lInner.y);
-                        const lHeight = Math.hypot(lTop.x - lBottom.x, lTop.y - lBottom.y);
-                        const earL = lHeight / lWidth;
-
-                        const rInner = landmarks[362];
-                        const rOuter = landmarks[263];
-                        const rTop = landmarks[386];
-                        const rBottom = landmarks[374];
-                        const rWidth = Math.hypot(rOuter.x - rInner.x, rOuter.y - rInner.y);
-                        const rHeight = Math.hypot(rTop.x - rBottom.x, rTop.y - rBottom.y);
-                        const earR = rHeight / rWidth;
-
-                        // 2. Gaze Direction
-                        const lIris = landmarks[468];
-                        const lEyeCenterX = (lOuter.x + lInner.x) / 2;
-                        const lGazeOffset = Math.abs(lIris.x - lEyeCenterX) / lWidth;
-
-                        const rIris = landmarks[473];
-                        const rEyeCenterX = (rOuter.x + rInner.x) / 2;
-                        const rGazeOffset = Math.abs(rIris.x - rEyeCenterX) / rWidth;
-
-                        // 3. Head Pose Factor
-                        let yaw = 0;
-                        let pitch = 0;
-                        if (results.facialTransformationMatrixes && results.facialTransformationMatrixes.length > 0) {
-                            const matrix = results.facialTransformationMatrixes[0].data;
-                            pitch = Math.atan2(matrix[6], matrix[10]);
-                            yaw = Math.atan2(-matrix[2], Math.sqrt(matrix[6] * matrix[6] + matrix[10] * matrix[10]));
-                        }
-
-                        console.log(`[Face Liveness] EAR (L:${earL.toFixed(2)}, R:${earR.toFixed(2)}) | Gaze: (L:${lGazeOffset.toFixed(2)}, R:${rGazeOffset.toFixed(2)}) | Pose: (Y:${yaw.toFixed(2)}, P:${pitch.toFixed(2)})`);
-
-                        if (earL < CONFIG.FACE_MIN_EAR || earR < CONFIG.FACE_MIN_EAR) {
-                            feedback = "Keep your eyes open.";
-                            captureTimer = 0;
-                        } else if (lGazeOffset > CONFIG.FACE_MAX_GAZE_OFFSET || rGazeOffset > CONFIG.FACE_MAX_GAZE_OFFSET) {
-                            feedback = "Look directly at the camera.";
-                            captureTimer = 0;
-                        } else if (Math.abs(yaw) > CONFIG.FACE_MAX_POSE_ANGLE || Math.abs(pitch) > CONFIG.FACE_MAX_POSE_ANGLE) {
-                            feedback = "Face the camera directly.";
+                        } else if (faceWidthRatio < CONFIG.FACE_MIN_WIDTH_RATIO) {
+                            feedback = "Move your phone closer.";
                             captureTimer = 0;
                         } else {
-                            const variance = getLaplacianVariance(frameData, width, height, { x: boundingBox.x, y: boundingBox.y, w: boundingBox.width, h: boundingBox.height });
-                            if (variance < CONFIG.FACE_MIN_VARIANCE) {
-                                feedback = "Face is blurry. Hold still.";
+                            // 1. Eye Openness (EAR)
+                            const lOuter = landmarks[33];
+                            const lInner = landmarks[133];
+                            const lTop = landmarks[159];
+                            const lBottom = landmarks[145];
+                            const lWidth = Math.hypot(lOuter.x - lInner.x, lOuter.y - lInner.y);
+                            const lHeight = Math.hypot(lTop.x - lBottom.x, lTop.y - lBottom.y);
+                            const earL = lHeight / lWidth;
+
+                            const rInner = landmarks[362];
+                            const rOuter = landmarks[263];
+                            const rTop = landmarks[386];
+                            const rBottom = landmarks[374];
+                            const rWidth = Math.hypot(rOuter.x - rInner.x, rOuter.y - rInner.y);
+                            const rHeight = Math.hypot(rTop.x - rBottom.x, rTop.y - rBottom.y);
+                            const earR = rHeight / rWidth;
+
+                            // 2. Gaze Direction
+                            const lIris = landmarks[468];
+                            const lEyeCenterX = (lOuter.x + lInner.x) / 2;
+                            const lGazeOffset = Math.abs(lIris.x - lEyeCenterX) / lWidth;
+
+                            const rIris = landmarks[473];
+                            const rEyeCenterX = (rOuter.x + rInner.x) / 2;
+                            const rGazeOffset = Math.abs(rIris.x - rEyeCenterX) / rWidth;
+
+                            // 3. Head Pose Factor
+                            let yaw = 0;
+                            let pitch = 0;
+                            if (results.facialTransformationMatrixes && results.facialTransformationMatrixes.length > 0) {
+                                const matrix = results.facialTransformationMatrixes[0].data;
+                                pitch = Math.atan2(matrix[6], matrix[10]);
+                                yaw = Math.atan2(-matrix[2], Math.sqrt(matrix[6] * matrix[6] + matrix[10] * matrix[10]));
+                            }
+
+                            console.log(`[Face Liveness] EAR (L:${earL.toFixed(2)}, R:${earR.toFixed(2)}) | Gaze: (L:${lGazeOffset.toFixed(2)}, R:${rGazeOffset.toFixed(2)}) | Pose: (Y:${yaw.toFixed(2)}, P:${pitch.toFixed(2)})`);
+
+                            if (earL < CONFIG.FACE_MIN_EAR || earR < CONFIG.FACE_MIN_EAR) {
+                                feedback = "Keep your eyes open.";
                                 captureTimer = 0;
-                                isReady = false;
+                            } else if (lGazeOffset > CONFIG.FACE_MAX_GAZE_OFFSET || rGazeOffset > CONFIG.FACE_MAX_GAZE_OFFSET) {
+                                feedback = "Look directly at the camera.";
+                                captureTimer = 0;
+                            } else if (Math.abs(yaw) > CONFIG.FACE_MAX_POSE_ANGLE || Math.abs(pitch) > CONFIG.FACE_MAX_POSE_ANGLE) {
+                                feedback = "Face the camera directly.";
+                                captureTimer = 0;
                             } else {
-                                feedback = "Face clear. Hold still...";
-                                isReady = true;
-                                captureTimer++;
-                                if (captureTimer > CONFIG.FACE_CAPTURE_FRAMES) { // 500ms at 30fps
-                                    capturedImage = await captureImage(frameData, width, height);
+                                const variance = getLaplacianVariance(frameData, width, height, { x: boundingBox.x, y: boundingBox.y, w: boundingBox.width, h: boundingBox.height });
+                                if (variance < CONFIG.FACE_MIN_VARIANCE) {
+                                    feedback = "Face is blurry. Hold still.";
                                     captureTimer = 0;
+                                    isReady = false;
+                                } else {
+                                    feedback = "Face clear. Hold still...";
+                                    isReady = true;
+                                    captureTimer++;
+                                    if (captureTimer > CONFIG.FACE_CAPTURE_FRAMES) { // 500ms at 30fps
+                                        capturedImage = await captureImage(frameData, width, height);
+                                        captureTimer = 0;
+                                    }
                                 }
                             }
                         }
+                    } else {
+                        captureTimer = 0;
+                        feedback = "Center your face.";
                     }
-                } else {
-                    captureTimer = 0;
-                    feedback = "Center your face.";
+                } catch (err) {
+                    console.error("[Worker] FaceLandmarker error:", err);
+                    feedback = "Analyzing face...";
                 }
-            } catch (err) {
-                console.error("[Worker] FaceLandmarker error:", err);
-                feedback = "Analyzing face...";
             }
+            const progress = isReady ? Math.min(1, captureTimer / CONFIG.FACE_CAPTURE_FRAMES) : 0;
+            self.postMessage({ type: 'FRAME_RESULT', stage, feedback, isReady, boundingBox, capturedImage, progress });
         }
-        const progress = isReady ? Math.min(1, captureTimer / CONFIG.FACE_CAPTURE_FRAMES) : 0;
-        self.postMessage({ type: 'FRAME_RESULT', stage, feedback, isReady, boundingBox, capturedImage, progress });
+    } finally {
+        if (bitmap) bitmap.close();
     }
 };
