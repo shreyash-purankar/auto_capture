@@ -47,8 +47,10 @@ const CONFIG = {
 
 
     // Face Capture (MediaPipe)
-    FACE_MIN_WIDTH_RATIO: 0.25, // Face must take up at least 25% of the frame width
+    FACE_MIN_WIDTH_RATIO: 0.25, // Face must take up at least 25% of the frame width (desktop)
+    FACE_MIN_WIDTH_RATIO_MOBILE: 0.15, // Face must take up at least 15% of the frame width (mobile - more comfortable distance)
     FACE_CENTER_TOLERANCE: 0.25, // Face must be within 25% of the center
+    FACE_CENTER_TOLERANCE_MOBILE: 0.25, // Face must be within 30% of the center (mobile - more forgiving)
     FACE_MIN_EAR: 0.2,        // Minimum Eye Aspect Ratio (openness)
     FACE_MAX_GAZE_OFFSET: 0.1, // Maximum gaze offset from center
     FACE_MAX_POSE_ANGLE: 0.2, // Maximum head pose angle (yaw/pitch in radians)
@@ -945,13 +947,17 @@ self.onmessage = async (e: MessageEvent) => {
                         const faceWidthRatio = boundingBox.width / width;
                         const faceCenterX = boundingBox.x + (boundingBox.width / 2);
                         const faceCenterY = boundingBox.y + (boundingBox.height / 2);
-                        const isCentered = Math.abs(faceCenterX - width / 2) < width * CONFIG.FACE_CENTER_TOLERANCE && Math.abs(faceCenterY - height / 2) < height * CONFIG.FACE_CENTER_TOLERANCE;
+                        
+                        // Use mobile-specific thresholds when on mobile devices
+                        const minWidthRatio = isMobileDevice ? CONFIG.FACE_MIN_WIDTH_RATIO_MOBILE : CONFIG.FACE_MIN_WIDTH_RATIO;
+                        const centerTolerance = isMobileDevice ? CONFIG.FACE_CENTER_TOLERANCE_MOBILE : CONFIG.FACE_CENTER_TOLERANCE;
+                        const isCentered = Math.abs(faceCenterX - width / 2) < width * centerTolerance && Math.abs(faceCenterY - height / 2) < height * centerTolerance;
 
                         if (!isCentered) {
                             feedback = "Center your face in the frame.";
                             captureTimer = 0;
-                        } else if (faceWidthRatio < CONFIG.FACE_MIN_WIDTH_RATIO) {
-                            feedback = "Move your phone closer.";
+                        } else if (faceWidthRatio < minWidthRatio) {
+                            feedback = isMobileDevice ? "Move closer to the camera." : "Move your phone closer.";
                             captureTimer = 0;
                         } else {
                             // 1. Eye Openness (EAR)
