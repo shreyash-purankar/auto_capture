@@ -32,16 +32,21 @@ const CONFIG = {
     MAX_BRIGHTNESS: 240,      // Maximum average pixel intensity (0-255)
     MIN_GLOBAL_VARIANCE: 20,  // Minimum Laplacian variance for the entire frame (lowered from 80)
 
-    // ID Capture (YOLO & OpenCV)
+    // ID Capture (YOL & OpenCV)
     YOLO_SIZE: 640,           // Input size for YOLOv11
     YOLO_SIZE_MOBILE: 320,    // Reduced input size for mobile devices
     YOLO_CONFIDENCE: 0.15,    // Minimum confidence score — kept low so close-up shots (where YOLO loses background context) still fire
     ID_MIN_WIDTH_RATIO: 0.38, // ID must take up at least 38% of the frame width (closer to camera)
+    ID_MIN_WIDTH_RATIO_MOBILE: 0.42, // ID must take up at least 42% of the frame width on mobile (stricter to avoid false positives)
     ID_MAX_DIST_CENTER: 0.95,  // Maximum distance from center
     ID_ASPECT_RATIO: 1.58,    // Standard ID card aspect ratio (width/height)
     ID_ASPECT_TOLERANCE: 0.40, // Wide tolerance — close-up perspective distortion skews the ratio
+    ID_ASPECT_TOLERANCE_MOBILE: 0.30, // Stricter tolerance for mobile fallback detection
     ID_BOX_EXPAND_FACTOR: 1.10, // Expand YOLO box by 10% so OpenCV sees full card edges and corners
     ID_MIN_VARIANCE: 90,     // Minimum Laplacian variance for the ID crop (raised to reject blurry captures)
+    ID_MIN_VARIANCE_MOBILE: 45, // Lower variance threshold for mobile (but with stricter shape validation)
+    ID_MIN_TEXTURE_VARIANCE: 300, // Minimum texture variance inside the ID region (cards have text/images)
+    ID_MIN_EDGE_DENSITY: 0.015, // Minimum edge pixel ratio for valid ID detection (1.5% of pixels should be edges)
     ID_STABILITY_TOLERANCE: 0.25, // Maximum allowed movement between frames
     ID_CAPTURE_FRAMES: 15,    // Number of consecutive stable frames required to auto-capture
 
@@ -224,6 +229,67 @@ function getLaplacianVariance(data: Uint8ClampedArray, width: number, height: nu
     return (sqSum / count) - (mean * mean);
 }
 
+// Calculate texture variance to ensure the region has actual content (text, images, patterns)
+// ID cards have high texture variance due to text, photos, holograms, etc.
+function getTextureVariance(data: Uint8ClampedArray, width: number, height: number, box: { x: number, y: number, w: number, h: number }): number {
+    const startX = Math.max(0, Math.floor(box.x));
+    const startY = Math.max(0, Math.floor(box.y));
+    const cropW = Math.min(width - startX, Math.floor(box.w));
+    const cropH = Math.min(height - startY, Math.floor(box.h));
+
+    let sum = 0, sqSum = 0, count = 0;
+
+    // Sample every 3rd pixel for performance
+    for (let y = startY; y < startY + cropH; y += 3) {
+        for (let x = startX; x < startX + cropW; x += 3) {
+            const idx = (y * width + x) * 4;
+            // Use luminance calculation
+            const luminance = 0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2];
+            sum += luminance;
+            sqSum += luminance * luminance;
+            count++;
+        }
+    }
+    
+    if (count === 0) return 0;
+    const mean = sum / count;
+    return (sqSum / count) - (mean * mean);
+}
+
+// Calculate edge density to verify the region has card-like structure
+function getEdgeDensity(data: Uint8ClampedArray, width: number, height: number, box: { x: number, y: number, w: number, h: number }): number {
+    const startX = Math.max(1, Math.floor(box.x));
+    const startY = Math.max(1, Math.floor(box.y));
+    const cropW = Math.min(width - startX - 1, Math.floor(box.w));
+    const cropH = Math.min(height - startY - 1, Math.floor(box.h));
+
+    let edgeCount = 0;
+    let totalCount = 0;
+
+    // Use Sobel edge detection with a threshold
+    for (let y = startY + 1; y < startY + cropH - 1; y += 2) {
+        for (let x = startX + 1; x < startX + cropW - 1; x += 2) {
+            const idx = (y * width + x) * 4 + 1; // Green channel
+            
+            // Sobel operators for gradient
+            const gx = -data[((y - 1) * width + (x - 1)) * 4 + 1] + data[((y - 1) * width + (x + 1)) * 4 + 1]
+                - 2 * data[(y * width + (x - 1)) * 4 + 1] + 2 * data[(y * width + (x + 1)) * 4 + 1]
+                - data[((y + 1) * width + (x - 1)) * 4 + 1] + data[((y + 1) * width + (x + 1)) * 4 + 1];
+            
+            const gy = -data[((y - 1) * width + (x - 1)) * 4 + 1] - 2 * data[((y - 1) * width + x) * 4 + 1] - data[((y - 1) * width + (x + 1)) * 4 + 1]
+                + data[((y + 1) * width + (x - 1)) * 4 + 1] + 2 * data[((y + 1) * width + x) * 4 + 1] + data[((y + 1) * width + (x + 1)) * 4 + 1];
+            
+            const magnitude = Math.abs(gx) + Math.abs(gy);
+            if (magnitude > 80) { // Edge threshold
+                edgeCount++;
+            }
+            totalCount++;
+        }
+    }
+    
+    return totalCount > 0 ? edgeCount / totalCount : 0;
+}
+
 function findIDCardBoundingBox(data: Uint8ClampedArray, width: number, height: number, faceBox?: { x: number, y: number, w: number, h: number } | null) {
     const scale = 4;
     const w = Math.floor(width / scale);
@@ -243,6 +309,7 @@ function findIDCardBoundingBox(data: Uint8ClampedArray, width: number, height: n
     const fx2 = faceBox ? Math.floor((faceBox.x + faceBox.w) / scale) : -1;
     const fy2 = faceBox ? Math.floor((faceBox.y + faceBox.h) / scale) : -1;
 
+    let totalEdgePixels = 0;
     for (let y = 1; y < h - 1; y++) {
         for (let x = 1; x < w - 1; x++) {
             if (faceBox && x >= fx1 && x <= fx2 && y >= fy1 && y <= fy2) {
@@ -256,8 +323,15 @@ function findIDCardBoundingBox(data: Uint8ClampedArray, width: number, height: n
             const mag = Math.abs(gx) + Math.abs(gy);
             if (mag > 100) {
                 edges[y * w + x] = 1;
+                totalEdgePixels++;
             }
         }
+    }
+
+    // Require minimum edge density — prevents detecting blank surfaces or single-color objects
+    const minEdges = w * h * 0.008; // At least 0.8% of pixels should be edges
+    if (totalEdgePixels < minEdges) {
+        return null;
     }
 
     // Project edges to X and Y axes
@@ -311,22 +385,41 @@ function findIDCardBoundingBox(data: Uint8ClampedArray, width: number, height: n
     const xSeg = findLongestSegment(colSum, colThreshold);
     const ySeg = findLongestSegment(rowSum, rowThreshold);
 
-    if (xSeg.len < w * 0.15 || ySeg.len < h * 0.15) return null;
+    // Stricter minimum size requirements
+    if (xSeg.len < w * 0.25 || ySeg.len < h * 0.25) return null;
 
     const boxW = xSeg.len;
     const boxH = ySeg.len;
     const minX = xSeg.start;
     const minY = ySeg.start;
 
+    // Verify aspect ratio before returning - ID cards have characteristic proportions
+    const aspectRatio = boxW / boxH;
+    const isValidAspect = Math.abs(aspectRatio - CONFIG.ID_ASPECT_RATIO) < CONFIG.ID_ASPECT_TOLERANCE_MOBILE ||
+                          Math.abs((1 / aspectRatio) - CONFIG.ID_ASPECT_RATIO) < CONFIG.ID_ASPECT_TOLERANCE_MOBILE;
+    
+    if (!isValidAspect) {
+        return null;
+    }
+
     const padX = 0; // Removed padding to make box tighter
     const padY = 0;
 
-    return {
+    const finalBox = {
         x: Math.max(0, (minX - padX) * scale),
         y: Math.max(0, (minY - padY) * scale),
         width: Math.min(width, (boxW + padX * 2) * scale),
         height: Math.min(height, (boxH + padY * 2) * scale)
     };
+
+    // Final validation: check if the box is too small relative to frame (minimum size)
+    const widthRatio = finalBox.width / width;
+    const heightRatio = finalBox.height / height;
+    if (widthRatio < CONFIG.ID_MIN_WIDTH_RATIO_MOBILE || heightRatio < (CONFIG.ID_MIN_WIDTH_RATIO_MOBILE / CONFIG.ID_ASPECT_RATIO)) {
+        return null;
+    }
+
+    return finalBox;
 }
 
 async function captureImage(frameData: Uint8ClampedArray, width: number, height: number, box?: { x: number, y: number, width: number, height: number }): Promise<Blob> {
@@ -711,10 +804,12 @@ self.onmessage = async (e: MessageEvent) => {
                             const isVertical = Math.abs(ratio - (1 / CONFIG.ID_ASPECT_RATIO)) < CONFIG.ID_ASPECT_TOLERANCE;
                             const distToCenter = Math.sqrt(Math.pow(cx - width / 2, 2) + Math.pow(cy - height / 2, 2));
 
+                            const minWidthRatio = isMobileDevice ? CONFIG.ID_MIN_WIDTH_RATIO_MOBILE : CONFIG.ID_MIN_WIDTH_RATIO;
+
                             if (!isHorizontal && !isVertical) {
                                 feedback = "Align ID directly to the frame.";
                                 captureTimer = Math.max(0, captureTimer - 2);
-                            } else if (w < width * CONFIG.ID_MIN_WIDTH_RATIO) {
+                            } else if (w < width * minWidthRatio) {
                                 feedback = "Bring the ID closer to the camera.";
                                 captureTimer = Math.max(0, captureTimer - 2);
                             } else if (distToCenter > width * CONFIG.ID_MAX_DIST_CENTER) {
@@ -808,6 +903,23 @@ self.onmessage = async (e: MessageEvent) => {
                                     h: boundingBox!.height 
                                 });
 
+                                // Additional quality checks for mobile
+                                const textureVariance = getTextureVariance(fullFrameData.data, width, height, {
+                                    x: boundingBox!.x,
+                                    y: boundingBox!.y,
+                                    w: boundingBox!.width,
+                                    h: boundingBox!.height
+                                });
+
+                                const edgeDensity = getEdgeDensity(fullFrameData.data, width, height, {
+                                    x: boundingBox!.x,
+                                    y: boundingBox!.y,
+                                    w: boundingBox!.width,
+                                    h: boundingBox!.height
+                                });
+
+                                console.log(`[Mobile YOLO] Variance: ${variance.toFixed(1)}, Texture: ${textureVariance.toFixed(1)}, EdgeDensity: ${(edgeDensity * 100).toFixed(2)}%`);
+
                                 let isStableBox = true;
                                 if (previousBoundingBox) {
                                     const dx = Math.abs(boundingBox!.x - previousBoundingBox.x);
@@ -818,9 +930,20 @@ self.onmessage = async (e: MessageEvent) => {
                                 }
                                 previousBoundingBox = { ...boundingBox! };
 
-                                if (variance < CONFIG.ID_MIN_VARIANCE * 0.7 || !isStableBox) {
-                                    // Lower variance threshold for mobile
-                                    feedback = !isStableBox ? "Hold ID still." : "ID is blurry. Hold steady.";
+                                if (variance < CONFIG.ID_MIN_VARIANCE_MOBILE) {
+                                    feedback = "ID is blurry. Hold steady.";
+                                    isReady = false;
+                                    captureTimer = Math.max(0, captureTimer - 2);
+                                } else if (textureVariance < CONFIG.ID_MIN_TEXTURE_VARIANCE) {
+                                    feedback = "Can't see ID details. Adjust lighting or angle.";
+                                    isReady = false;
+                                    captureTimer = Math.max(0, captureTimer - 2);
+                                } else if (edgeDensity < CONFIG.ID_MIN_EDGE_DENSITY) {
+                                    feedback = "Show a valid ID card.";
+                                    isReady = false;
+                                    captureTimer = Math.max(0, captureTimer - 2);
+                                } else if (!isStableBox) {
+                                    feedback = "Hold ID still.";
                                     isReady = false;
                                     captureTimer = Math.max(0, captureTimer - 2);
                                 } else {
@@ -883,8 +1006,8 @@ self.onmessage = async (e: MessageEvent) => {
                 } else {
                     boundingBox = box;
                     const ratio = box.width / box.height;
-                    const isHorizontal = Math.abs(ratio - CONFIG.ID_ASPECT_RATIO) < CONFIG.ID_ASPECT_TOLERANCE;
-                    const isVertical = Math.abs(ratio - (1 / CONFIG.ID_ASPECT_RATIO)) < CONFIG.ID_ASPECT_TOLERANCE;
+                    const isHorizontal = Math.abs(ratio - CONFIG.ID_ASPECT_RATIO) < CONFIG.ID_ASPECT_TOLERANCE_MOBILE;
+                    const isVertical = Math.abs(ratio - (1 / CONFIG.ID_ASPECT_RATIO)) < CONFIG.ID_ASPECT_TOLERANCE_MOBILE;
 
                     const isCutOff = box.x <= 0 || box.y <= 0 || (box.x + box.width) >= width || (box.y + box.height) >= height;
 
@@ -897,18 +1020,47 @@ self.onmessage = async (e: MessageEvent) => {
                         captureTimer = 0;
                         isReady = false;
                     } else {
+                        // Multiple quality checks for robust ID validation on mobile
                         const variance = getLaplacianVariance(frameData, width, height, { x: box.x, y: box.y, w: box.width, h: box.height });
+                        const textureVariance = getTextureVariance(frameData, width, height, { x: box.x, y: box.y, w: box.width, h: box.height });
+                        const edgeDensity = getEdgeDensity(frameData, width, height, { x: box.x, y: box.y, w: box.width, h: box.height });
 
-                        if (variance < CONFIG.MIN_GLOBAL_VARIANCE) {
+                        // Log metrics for debugging
+                        console.log(`[Mobile ID Detection] Variance: ${variance.toFixed(1)}, Texture: ${textureVariance.toFixed(1)}, EdgeDensity: ${(edgeDensity * 100).toFixed(2)}%`);
+
+                        // Check stability
+                        let isStableBox = true;
+                        if (previousBoundingBox) {
+                            const dx = Math.abs(box.x - previousBoundingBox.x);
+                            const dy = Math.abs(box.y - previousBoundingBox.y);
+                            if (dx > width * CONFIG.ID_STABILITY_TOLERANCE || dy > height * CONFIG.ID_STABILITY_TOLERANCE) {
+                                isStableBox = false;
+                            }
+                        }
+                        previousBoundingBox = { ...box };
+
+                        if (variance < CONFIG.ID_MIN_VARIANCE_MOBILE) {
                             feedback = "ID is blurry. Hold steady.";
                             isReady = false;
-                            captureTimer = 0;
+                            captureTimer = Math.max(0, captureTimer - 2);
+                        } else if (textureVariance < CONFIG.ID_MIN_TEXTURE_VARIANCE) {
+                            feedback = "Can't see ID details. Adjust lighting or angle.";
+                            isReady = false;
+                            captureTimer = Math.max(0, captureTimer - 2);
+                        } else if (edgeDensity < CONFIG.ID_MIN_EDGE_DENSITY) {
+                            feedback = "Show a valid ID card.";
+                            isReady = false;
+                            captureTimer = Math.max(0, captureTimer - 2);
+                        } else if (!isStableBox) {
+                            feedback = "Hold ID still.";
+                            isReady = false;
+                            captureTimer = Math.max(0, captureTimer - 2);
                         } else {
                             feedback = "Perfect. Hold steady...";
                             isReady = true;
                             captureTimer++;
                             if (captureTimer > CONFIG.ID_CAPTURE_FRAMES) {
-                                capturedImage = await captureImage(frameData, width, height);
+                                capturedImage = await captureImage(frameData, width, height, box);
                                 captureTimer = 0;
                             }
                         }
