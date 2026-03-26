@@ -694,10 +694,14 @@ self.onmessage = async (e: MessageEvent) => {
             const isNewStage = (now - stageTransitionTimestamp) > 1000; // New stage if >1s since last
             if (isNewStage) {
                 stageTransitionTimestamp = now;
-                // Pre-emptively set frame skip for low-tier devices to avoid initial lag
+                // Pre-emptively set frame skip for low-tier devices and mobile to avoid initial lag
                 if (currentTier === 'low' && !isMobileDevice) {
                     frameSkipRate = 3; // Start with aggressive skipping to prevent initial lag
                     console.log("[Worker] ⚡ Pre-emptive frame skip 1/3 enabled for low-end laptop");
+                }
+                if (isMobileDevice) {
+                    frameSkipRate = 2; // Mobile always starts with 2x frame skip for YOLO
+                    console.log("[Worker] ⚡ Pre-emptive frame skip 1/2 enabled for mobile device");
                 }
                 // Reset performance metrics for new stage
                 frameProcessingTimes = [];
@@ -714,9 +718,10 @@ self.onmessage = async (e: MessageEvent) => {
             
             if (useYOLO) {
                 try {
-                    // Frame skipping for low-end devices
+                    // Frame skipping for low-end devices AND mobile (mobile gets more aggressive skipping)
                     skipCounter++;
-                    if (skipCounter % frameSkipRate !== 0) {
+                    const mobileSkipRate = isMobileDevice ? Math.max(frameSkipRate, 2) : frameSkipRate;
+                    if (skipCounter % mobileSkipRate !== 0) {
                         // Skip this frame - but MUST send a response to unlock the main thread
                         // Reuse the last feedback and bounding box to keep UI responsive
                         const progress = isReady ? Math.min(1, captureTimer / CONFIG.ID_CAPTURE_FRAMES) : 0;
@@ -734,7 +739,8 @@ self.onmessage = async (e: MessageEvent) => {
                     }
                     
                     const frameStartTime = performance.now();
-                    const yoloInputSize = isMobileDevice ? CONFIG.YOLO_SIZE_MOBILE : CONFIG.YOLO_SIZE;
+                    // YOLO model requires 640x640 input - cannot use smaller size
+                    const yoloInputSize = CONFIG.YOLO_SIZE;
                     
                     // --- LETTERBOX: pad the 16:9 frame to a square so YOLO sees undistorted geometry ---
                     // Direct resize to 640×640 compresses horizontal pixels ~3× more than vertical,
@@ -1055,7 +1061,10 @@ self.onmessage = async (e: MessageEvent) => {
                     }
                 } catch (err) {
                     console.error("[Worker] YOLO Crash Intercepted: ", err);
-                    feedback = "Analyzing ID...";
+                    feedback = "Show your ID card to the camera.";
+                    isReady = false;
+                    boundingBox = null;
+                    captureTimer = 0;
                 }
             } else {
                 // FALLBACK ID DETECTION (Using bitmap)
