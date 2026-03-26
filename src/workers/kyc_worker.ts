@@ -23,6 +23,7 @@ let roiCtx: OffscreenCanvasRenderingContext2D | null = null;
 // Feedback debounce state
 let lastFeedbackText = '';
 let feedbackSameCount = 0;
+let isMobileDevice = false;
 
 // --- CONFIGURATION CONSTANTS ---
 const CONFIG = {
@@ -33,6 +34,7 @@ const CONFIG = {
 
     // ID Capture (YOLO & OpenCV)
     YOLO_SIZE: 640,           // Input size for YOLOv11
+    YOLO_SIZE_MOBILE: 320,    // Reduced input size for mobile devices
     YOLO_CONFIDENCE: 0.15,    // Minimum confidence score — kept low so close-up shots (where YOLO loses background context) still fire
     ID_MIN_WIDTH_RATIO: 0.38, // ID must take up at least 38% of the frame width (closer to camera)
     ID_MAX_DIST_CENTER: 0.95,  // Maximum distance from center
@@ -526,7 +528,12 @@ self.onmessage = async (e: MessageEvent) => {
         forceNextCapture = true;
         return;
     }
-    const { type, bitmap, width, height, stage, tier } = e.data;
+    const { type, bitmap, width, height, stage, tier, isMobile } = e.data;
+
+    // Capture mobile device flag
+    if (isMobile !== undefined) {
+        isMobileDevice = isMobile;
+    }
 
     if (type === 'INIT') {
         await initModels(tier);
@@ -588,8 +595,14 @@ self.onmessage = async (e: MessageEvent) => {
             let isReady = false;
             let capturedImage = null;
 
-            if (yoloModel) {
+            // Skip YOLO on mobile devices to save performance - use lightweight edge detection instead
+            const useYOLO = yoloModel && !isMobileDevice;
+            
+            if (useYOLO) {
                 try {
+                    // Use smaller YOLO input size to reduce processing time
+                    const yoloInputSize = isMobileDevice ? CONFIG.YOLO_SIZE_MOBILE : CONFIG.YOLO_SIZE;
+                    
                     // --- LETTERBOX: pad the 16:9 frame to a square so YOLO sees undistorted geometry ---
                     // Direct resize to 640×640 compresses horizontal pixels ~3× more than vertical,
                     // producing degenerate boxes (a thin strip) when the card fills the frame.
@@ -598,7 +611,7 @@ self.onmessage = async (e: MessageEvent) => {
                     const lbPadLeft = Math.floor((lbMaxDim - width) / 2);
                     const lbPadBottom = lbMaxDim - height - lbPadTop;
                     const lbPadRight = lbMaxDim - width - lbPadLeft;
-                    const lbScale = lbMaxDim / CONFIG.YOLO_SIZE; // original pixels per YOLO pixel
+                    const lbScale = lbMaxDim / yoloInputSize; // original pixels per YOLO pixel
 
                     const { boxes, maxScores, maxIdxTensor, debugShape, numClasses } = tf.tidy(() => {
                         // 1. Convert to Tensor (Optimized for WebGL/WASM)
@@ -606,7 +619,7 @@ self.onmessage = async (e: MessageEvent) => {
 
                         // 2. Letterbox-pad to square, then resize — preserves aspect ratio
                         const padded = tf.pad(imgTensor, [[lbPadTop, lbPadBottom], [lbPadLeft, lbPadRight], [0, 0]], 114);
-                        const resized = tf.image.resizeBilinear(padded as tf.Tensor3D, [CONFIG.YOLO_SIZE, CONFIG.YOLO_SIZE]);
+                        const resized = tf.image.resizeBilinear(padded as tf.Tensor3D, [yoloInputSize, yoloInputSize]);
                         const input = resized.expandDims(0).div(255.0);
 
                         // 3. Execute model
@@ -718,7 +731,8 @@ self.onmessage = async (e: MessageEvent) => {
                         }
 
                         if (proceedToQualityCheck) {
-                            if (cv) {
+                            if (cv && !isMobileDevice) {
+                                // Skip heavy OpenCV processing on mobile - use YOLO box directly
                                 // Extract ROI using dedicated roiCanvas to avoid thrashing offscreenCanvas dimensions
                                 const rx = Math.max(0, Math.floor(boundingBox!.x - boundingBox!.width * 0.15));
                                 const ry = Math.max(0, Math.floor(boundingBox!.y - boundingBox!.height * 0.15));
@@ -774,6 +788,47 @@ self.onmessage = async (e: MessageEvent) => {
                                         }
                                         offscreenCtx!.drawImage(bitmap, 0, 0);
                                         const fullFrameData = offscreenCtx!.getImageData(0, 0, width, height);
+                                        capturedImage = await captureImage(fullFrameData.data, width, height, boundingBox!);
+                                        captureTimer = 0;
+                                    }
+                                }
+                            } else if (isMobileDevice) {
+                                // Mobile: simplified quality check without OpenCV
+                                // Get ImageData for variance check
+                                if (!offscreenCanvas || offscreenCanvas.width !== width || offscreenCanvas.height !== height) {
+                                    offscreenCanvas = new OffscreenCanvas(width, height);
+                                    offscreenCtx = offscreenCanvas.getContext('2d', { willReadFrequently: true });
+                                }
+                                offscreenCtx!.drawImage(bitmap, 0, 0);
+                                const fullFrameData = offscreenCtx!.getImageData(0, 0, width, height);
+                                
+                                const variance = getLaplacianVariance(fullFrameData.data, width, height, { 
+                                    x: boundingBox!.x, 
+                                    y: boundingBox!.y, 
+                                    w: boundingBox!.width, 
+                                    h: boundingBox!.height 
+                                });
+
+                                let isStableBox = true;
+                                if (previousBoundingBox) {
+                                    const dx = Math.abs(boundingBox!.x - previousBoundingBox.x);
+                                    const dy = Math.abs(boundingBox!.y - previousBoundingBox.y);
+                                    if (dx > width * CONFIG.ID_STABILITY_TOLERANCE || dy > height * CONFIG.ID_STABILITY_TOLERANCE) {
+                                        isStableBox = false;
+                                    }
+                                }
+                                previousBoundingBox = { ...boundingBox! };
+
+                                if (variance < CONFIG.ID_MIN_VARIANCE * 0.7 || !isStableBox) {
+                                    // Lower variance threshold for mobile
+                                    feedback = !isStableBox ? "Hold ID still." : "ID is blurry. Hold steady.";
+                                    isReady = false;
+                                    captureTimer = Math.max(0, captureTimer - 2);
+                                } else {
+                                    feedback = "Perfect. Hold steady...";
+                                    isReady = true;
+                                    captureTimer++;
+                                    if (captureTimer > CONFIG.ID_CAPTURE_FRAMES) {
                                         capturedImage = await captureImage(fullFrameData.data, width, height, boundingBox!);
                                         captureTimer = 0;
                                     }

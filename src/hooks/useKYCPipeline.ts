@@ -60,7 +60,8 @@ export const useKYCPipeline = () => {
         };
 
         const isHighEnd = navigator.hardwareConcurrency ? navigator.hardwareConcurrency >= 4 : false;
-        worker.postMessage({ type: 'INIT', tier: isHighEnd ? 'high' : 'low' });
+        const mobile = isMobile();
+        worker.postMessage({ type: 'INIT', tier: isHighEnd ? 'high' : 'low', isMobile: mobile });
 
         worker.onerror = (err) => {
             console.error("[Main] Worker Error Encountered:", err);
@@ -108,13 +109,21 @@ export const useKYCPipeline = () => {
             setIsMirrored(mirror);
 
             try {
+                // Mobile devices use lower resolution to reduce processing load
+                const videoConstraints = mobile ? {
+                    facingMode,
+                    width: { min: 640, ideal: 1280, max: 1920 },
+                    height: { min: 480, ideal: 720, max: 1080 },
+                    aspectRatio: { ideal: 1.7777777778 } // 16:9
+                } : {
+                    facingMode,
+                    width: { min: 1280, ideal: 1920, max: 4096 },
+                    height: { min: 720, ideal: 1080, max: 2160 },
+                    aspectRatio: { ideal: 1.7777777778 } // 16:9
+                };
+
                 stream = await navigator.mediaDevices.getUserMedia({
-                    video: { 
-                        facingMode, 
-                        width: { min: 1280, ideal: 1920, max: 4096 }, 
-                        height: { min: 720, ideal: 1080, max: 2160 },
-                        aspectRatio: { ideal: 1.7777777778 } // 16:9
-                    }
+                    video: videoConstraints
                 });
                 if (isMounted && videoRef.current) {
                     videoRef.current.srcObject = stream;
@@ -146,9 +155,20 @@ export const useKYCPipeline = () => {
         let animationFrameId: number;
         let lastProcessedTime = 0;
 
+        const mobile = isMobile();
         const isHighEnd = navigator.hardwareConcurrency ? navigator.hardwareConcurrency >= 4 : false;
-        const throttleMs = isHighEnd ? 33 : 166; // 6fps for Tier 2 (Low-End Mobile)
-        console.log(`[Main] Performance Tier set: isHighEnd = ${isHighEnd}, throttleMs = ${throttleMs}ms`);
+        
+        // More aggressive throttling for mobile devices during ID capture
+        let throttleMs;
+        if (mobile && currentStage === KYCStage.ID_CAPTURE) {
+            throttleMs = 250; // 4fps for mobile ID capture
+        } else if (mobile) {
+            throttleMs = 166; // 6fps for mobile face capture
+        } else {
+            throttleMs = isHighEnd ? 33 : 100; // 30fps for desktop high-end, 10fps for low-end
+        }
+        
+        console.log(`[Main] Performance Tier: isHighEnd=${isHighEnd}, mobile=${mobile}, throttleMs=${throttleMs}ms`);
 
         const processFrame = async (timestamp: number) => {
             // Check throttle AND ensure worker is NOT busy
@@ -169,11 +189,13 @@ export const useKYCPipeline = () => {
                         // --- SET THE LOCK BEFORE SENDING ---
                         isProcessingWorker.current = true;
 
+                        const mobile = isMobile();
                         workerRef.current.postMessage({
                             stage: currentStage,
                             bitmap: bitmap,
                             width: video.videoWidth,
                             height: video.videoHeight,
+                            isMobile: mobile,
                         }, [bitmap]);
 
                         lastProcessedTime = timestamp;
