@@ -29,6 +29,7 @@ let isMobileDevice = false;
 let frameProcessingTimes: number[] = [];
 let skipCounter = 0;
 let frameSkipRate = 1; // Process every frame by default
+let stageTransitionTimestamp = 0; // Track when stage changes to optimize initial frames
 
 // --- CONFIGURATION CONSTANTS ---
 const CONFIG = {
@@ -688,6 +689,21 @@ self.onmessage = async (e: MessageEvent) => {
         }
 
         else if (stage === KYCStage.ID_CAPTURE) {
+            // Track stage transitions to optimize initial frames
+            const now = performance.now();
+            const isNewStage = (now - stageTransitionTimestamp) > 1000; // New stage if >1s since last
+            if (isNewStage) {
+                stageTransitionTimestamp = now;
+                // Pre-emptively set frame skip for low-tier devices to avoid initial lag
+                if (currentTier === 'low' && !isMobileDevice) {
+                    frameSkipRate = 3; // Start with aggressive skipping to prevent initial lag
+                    console.log("[Worker] ⚡ Pre-emptive frame skip 1/3 enabled for low-end laptop");
+                }
+                // Reset performance metrics for new stage
+                frameProcessingTimes = [];
+                skipCounter = 0;
+            }
+            
             let boundingBox = null;
             let feedback = yoloModel ? "Show your ID card to the camera." : "Simulating ID detector...";
             let isReady = false;
@@ -701,7 +717,19 @@ self.onmessage = async (e: MessageEvent) => {
                     // Frame skipping for low-end devices
                     skipCounter++;
                     if (skipCounter % frameSkipRate !== 0) {
-                        // Skip this frame - reuse previous feedback and box
+                        // Skip this frame - but MUST send a response to unlock the main thread
+                        // Reuse the last feedback and bounding box to keep UI responsive
+                        const progress = isReady ? Math.min(1, captureTimer / CONFIG.ID_CAPTURE_FRAMES) : 0;
+                        self.postMessage({ 
+                            type: 'FRAME_RESULT', 
+                            stage, 
+                            feedback: lastFeedbackText || "Analyzing ID...", 
+                            isReady, 
+                            boundingBox: smoothedBoundingBox, 
+                            capturedImage: null, 
+                            isMocking: false, 
+                            progress 
+                        });
                         return;
                     }
                     
@@ -773,19 +801,25 @@ self.onmessage = async (e: MessageEvent) => {
                         // Adaptive frame skipping: skip more frames if processing is slow
                         if (frameProcessingTimes.length >= 10) {
                             const avgProcessingTime = frameProcessingTimes.reduce((a, b) => a + b, 0) / frameProcessingTimes.length;
-                            if (avgProcessingTime > CONFIG.MAX_PROCESSING_MS && frameSkipRate < 3) {
-                                frameSkipRate = 2; // Process every 2nd frame
-                                console.log(`[Worker] ⚡ Enabling frame skip (avg processing: ${avgProcessingTime.toFixed(1)}ms)`);
-                            } else if (avgProcessingTime > CONFIG.MAX_PROCESSING_MS * 1.5 && frameSkipRate < 3) {
+                            
+                            // More aggressive thresholds for low-end devices
+                            const skipThreshold = currentTier === 'low' ? 100 : CONFIG.MAX_PROCESSING_MS;
+                            const highSkipThreshold = currentTier === 'low' ? 120 : CONFIG.MAX_PROCESSING_MS * 1.5;
+                            const disableThreshold = currentTier === 'low' ? 70 : CONFIG.MAX_PROCESSING_MS * 0.7;
+                            
+                            if (avgProcessingTime > highSkipThreshold && frameSkipRate < 3) {
                                 frameSkipRate = 3; // Process every 3rd frame
-                                console.log(`[Worker] ⚡ Increasing frame skip rate (avg processing: ${avgProcessingTime.toFixed(1)}ms)`);
-                            } else if (avgProcessingTime < CONFIG.MAX_PROCESSING_MS * 0.7 && frameSkipRate > 1) {
-                                frameSkipRate = 1; // Process every frame
-                                console.log(`[Worker] ⚡ Disabling frame skip (avg processing: ${avgProcessingTime.toFixed(1)}ms)`);
+                                console.log(`[Worker] ⚡⚡ Increasing frame skip to 1/3 (avg processing: ${avgProcessingTime.toFixed(1)}ms)`);
+                            } else if (avgProcessingTime > skipThreshold && frameSkipRate < 2) {
+                                frameSkipRate = 2; // Process every 2nd frame
+                                console.log(`[Worker] ⚡ Enabling frame skip to 1/2 (avg processing: ${avgProcessingTime.toFixed(1)}ms)`);
+                            } else if (avgProcessingTime < disableThreshold && frameSkipRate > 1) {
+                                frameSkipRate = Math.max(1, frameSkipRate - 1); // Gradually reduce skipping
+                                console.log(`[Worker] ⚡ Reducing frame skip to 1/${frameSkipRate} (avg processing: ${avgProcessingTime.toFixed(1)}ms)`);
                             }
                             
                             if (skipCounter % 60 === 0) {
-                                console.log(`[Worker] ⏱️  Performance: ${avgProcessingTime.toFixed(1)}ms/frame (skip rate: 1/${frameSkipRate})`);
+                                console.log(`[Worker] ⏱️  Performance: ${avgProcessingTime.toFixed(1)}ms/frame (skip rate: 1/${frameSkipRate}, tier: ${currentTier})`);
                             }
                         }
                     }
@@ -867,8 +901,10 @@ self.onmessage = async (e: MessageEvent) => {
                         }
 
                         if (proceedToQualityCheck) {
-                            if (cv && !isMobileDevice) {
-                                // Skip heavy OpenCV processing on mobile - use YOLO box directly
+                            // Skip heavy OpenCV processing on mobile AND low-end laptops - use YOLO box directly
+                            // Only high-end laptops get OpenCV refinement
+                            if (cv && !isMobileDevice && currentTier === 'high') {
+                                // OpenCV processing only for high-end laptops
                                 // Extract ROI using dedicated roiCanvas to avoid thrashing offscreenCanvas dimensions
                                 const rx = Math.max(0, Math.floor(boundingBox!.x - boundingBox!.width * 0.15));
                                 const ry = Math.max(0, Math.floor(boundingBox!.y - boundingBox!.height * 0.15));
@@ -928,7 +964,7 @@ self.onmessage = async (e: MessageEvent) => {
                                         captureTimer = 0;
                                     }
                                 }
-                            } else if (isMobileDevice) {
+                            } else if (isMobileDevice || currentTier === 'low') {
                                 // Mobile: simplified quality check without OpenCV
                                 // Get ImageData for variance check
                                 if (!offscreenCanvas || offscreenCanvas.width !== width || offscreenCanvas.height !== height) {
@@ -960,7 +996,8 @@ self.onmessage = async (e: MessageEvent) => {
                                     h: boundingBox!.height
                                 });
 
-                                console.log(`[Mobile YOLO] Variance: ${variance.toFixed(1)}, Texture: ${textureVariance.toFixed(1)}, EdgeDensity: ${(edgeDensity * 100).toFixed(2)}%`);
+                                const deviceLabel = isMobileDevice ? 'Mobile' : 'Low-End Laptop';
+                                console.log(`[${deviceLabel} YOLO] Variance: ${variance.toFixed(1)}, Texture: ${textureVariance.toFixed(1)}, EdgeDensity: ${(edgeDensity * 100).toFixed(2)}%`);
 
                                 let isStableBox = true;
                                 if (previousBoundingBox) {
@@ -972,15 +1009,20 @@ self.onmessage = async (e: MessageEvent) => {
                                 }
                                 previousBoundingBox = { ...boundingBox! };
 
-                                if (variance < CONFIG.ID_MIN_VARIANCE_MOBILE) {
+                                // Use relaxed variance threshold for low-end laptops (higher than mobile)
+                                const varianceThreshold = currentTier === 'low' ? CONFIG.ID_MIN_VARIANCE * 0.7 : CONFIG.ID_MIN_VARIANCE_MOBILE;
+                                const textureThreshold = currentTier === 'low' ? CONFIG.ID_MIN_TEXTURE_VARIANCE * 0.7 : CONFIG.ID_MIN_TEXTURE_VARIANCE;
+                                const edgeThreshold = currentTier === 'low' ? CONFIG.ID_MIN_EDGE_DENSITY * 0.8 : CONFIG.ID_MIN_EDGE_DENSITY;
+                                
+                                if (variance < varianceThreshold) {
                                     feedback = "ID is blurry. Hold steady.";
                                     isReady = false;
                                     captureTimer = Math.max(0, captureTimer - 2);
-                                } else if (textureVariance < CONFIG.ID_MIN_TEXTURE_VARIANCE) {
+                                } else if (textureVariance < textureThreshold) {
                                     feedback = "Can't see ID details. Adjust lighting or angle.";
                                     isReady = false;
                                     captureTimer = Math.max(0, captureTimer - 2);
-                                } else if (edgeDensity < CONFIG.ID_MIN_EDGE_DENSITY) {
+                                } else if (edgeDensity < edgeThreshold) {
                                     feedback = "Show a valid ID card.";
                                     isReady = false;
                                     captureTimer = Math.max(0, captureTimer - 2);
@@ -992,7 +1034,9 @@ self.onmessage = async (e: MessageEvent) => {
                                     feedback = "Perfect. Hold steady...";
                                     isReady = true;
                                     captureTimer++;
-                                    if (captureTimer > CONFIG.ID_CAPTURE_FRAMES) {
+                                    // Faster capture for low-end devices (fewer frames required)
+                                    const captureThreshold = currentTier === 'low' ? CONFIG.ID_CAPTURE_FRAMES * 0.6 : CONFIG.ID_CAPTURE_FRAMES;
+                                    if (captureTimer > captureThreshold) {
                                         capturedImage = await captureImage(fullFrameData.data, width, height, boundingBox!);
                                         captureTimer = 0;
                                     }
@@ -1110,7 +1154,9 @@ self.onmessage = async (e: MessageEvent) => {
                 }
             }
 
-            const progress = isReady ? Math.min(1, captureTimer / CONFIG.ID_CAPTURE_FRAMES) : 0;
+            // Calculate progress based on device tier (low-end devices have faster capture)
+            const captureThreshold = currentTier === 'low' ? CONFIG.ID_CAPTURE_FRAMES * 0.6 : CONFIG.ID_CAPTURE_FRAMES;
+            const progress = isReady ? Math.min(1, captureTimer / captureThreshold) : 0;
             self.postMessage({ type: 'FRAME_RESULT', stage, feedback: debounceFeedback(feedback), isReady, boundingBox, capturedImage, isMocking: false, progress });
         }
 
