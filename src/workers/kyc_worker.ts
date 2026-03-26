@@ -25,6 +25,12 @@ let lastFeedbackText = '';
 let feedbackSameCount = 0;
 let isMobileDevice = false;
 
+// Performance monitoring for adaptive resolution
+let yoloInferenceTimes: number[] = [];
+let currentYoloSize = 640;
+let performanceSamples = 0;
+const MAX_PERFORMANCE_SAMPLES = 10;
+
 // --- CONFIGURATION CONSTANTS ---
 const CONFIG = {
     // Pre-Flight Checks
@@ -33,9 +39,12 @@ const CONFIG = {
     MIN_GLOBAL_VARIANCE: 20,  // Minimum Laplacian variance for the entire frame (lowered from 80)
 
     // ID Capture (YOL & OpenCV)
-    YOLO_SIZE: 640,           // Input size for YOLOv11
+    YOLO_SIZE: 640,           // Input size for YOLOv11 (high-end devices)
+    YOLO_SIZE_MEDIUM: 416,    // Medium input size for mid-tier devices
+    YOLO_SIZE_LOW: 320,       // Low input size for low-end devices
     YOLO_SIZE_MOBILE: 320,    // Reduced input size for mobile devices
     YOLO_CONFIDENCE: 0.15,    // Minimum confidence score — kept low so close-up shots (where YOLO loses background context) still fire
+    MAX_YOLO_INFERENCE_MS: 80, // Target max YOLO inference time (ms) — reduce resolution if exceeded
     ID_MIN_WIDTH_RATIO: 0.38, // ID must take up at least 38% of the frame width (closer to camera)
     ID_MIN_WIDTH_RATIO_MOBILE: 0.42, // ID must take up at least 42% of the frame width on mobile (stricter to avoid false positives)
     ID_MAX_DIST_CENTER: 0.95,  // Maximum distance from center
@@ -692,8 +701,9 @@ self.onmessage = async (e: MessageEvent) => {
             
             if (useYOLO) {
                 try {
-                    // Use smaller YOLO input size to reduce processing time
-                    const yoloInputSize = isMobileDevice ? CONFIG.YOLO_SIZE_MOBILE : CONFIG.YOLO_SIZE;
+                    // Adaptive YOLO input size based on device performance
+                    const yoloStartTime = performance.now();
+                    const yoloInputSize = isMobileDevice ? CONFIG.YOLO_SIZE_MOBILE : currentYoloSize;
                     
                     // --- LETTERBOX: pad the 16:9 frame to a square so YOLO sees undistorted geometry ---
                     // Direct resize to 640×640 compresses horizontal pixels ~3× more than vertical,
@@ -747,6 +757,49 @@ self.onmessage = async (e: MessageEvent) => {
                     ]);
 
                     tf.dispose([boxes, maxScores, maxIdxTensor]);
+                    
+                    // Track YOLO inference time for adaptive resolution (desktop only)
+                    if (!isMobileDevice) {
+                        const yoloEndTime = performance.now();
+                        const yoloInferenceTime = yoloEndTime - yoloStartTime;
+                        yoloInferenceTimes.push(yoloInferenceTime);
+                        if (yoloInferenceTimes.length > MAX_PERFORMANCE_SAMPLES) {
+                            yoloInferenceTimes.shift();
+                        }
+                        
+                        // Adaptive resolution: reduce YOLO size if inference is too slow
+                        if (performanceSamples >= MAX_PERFORMANCE_SAMPLES) {
+                            const avgYoloTime = yoloInferenceTimes.reduce((a, b) => a + b, 0) / yoloInferenceTimes.length;
+                            if (avgYoloTime > CONFIG.MAX_YOLO_INFERENCE_MS && currentYoloSize > CONFIG.YOLO_SIZE_LOW) {
+                                if (currentYoloSize === CONFIG.YOLO_SIZE) {
+                                    currentYoloSize = CONFIG.YOLO_SIZE_MEDIUM;
+                                    console.log(`[Worker] ⚡ Reducing YOLO resolution to ${currentYoloSize}x${currentYoloSize} (avg inference: ${avgYoloTime.toFixed(1)}ms)`);
+                                } else if (currentYoloSize === CONFIG.YOLO_SIZE_MEDIUM) {
+                                    currentYoloSize = CONFIG.YOLO_SIZE_LOW;
+                                    console.log(`[Worker] ⚡ Reducing YOLO resolution to ${currentYoloSize}x${currentYoloSize} (avg inference: ${avgYoloTime.toFixed(1)}ms)`);
+                                }
+                                yoloInferenceTimes = [];
+                                performanceSamples = 0;
+                            } else if (avgYoloTime < CONFIG.MAX_YOLO_INFERENCE_MS * 0.6 && currentYoloSize < CONFIG.YOLO_SIZE) {
+                                // Device is fast enough - increase resolution for better accuracy
+                                if (currentYoloSize === CONFIG.YOLO_SIZE_LOW) {
+                                    currentYoloSize = CONFIG.YOLO_SIZE_MEDIUM;
+                                    console.log(`[Worker] ⚡ Increasing YOLO resolution to ${currentYoloSize}x${currentYoloSize} (avg inference: ${avgYoloTime.toFixed(1)}ms)`);
+                                } else if (currentYoloSize === CONFIG.YOLO_SIZE_MEDIUM) {
+                                    currentYoloSize = CONFIG.YOLO_SIZE;
+                                    console.log(`[Worker] ⚡ Increasing YOLO resolution to ${currentYoloSize}x${currentYoloSize} (avg inference: ${avgYoloTime.toFixed(1)}ms)`);
+                                }
+                                yoloInferenceTimes = [];
+                                performanceSamples = 0;
+                            }
+                        }
+                        performanceSamples++;
+                        
+                        if (performanceSamples % 30 === 0) {
+                            const avgYolo = yoloInferenceTimes.reduce((a, b) => a + b, 0) / yoloInferenceTimes.length;
+                            console.log(`[Worker] ⏱️  Performance: YOLO=${avgYolo.toFixed(1)}ms @ ${currentYoloSize}x${currentYoloSize}`);
+                        }
+                    }
 
                     const maxIdx = idxData[0];
                     const score = scoresData[maxIdx];
