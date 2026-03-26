@@ -327,7 +327,7 @@ function findIDCardBoundingBox(data: Uint8ClampedArray, width: number, height: n
     };
 }
 
-async function captureImage(frameData: Uint8ClampedArray, width: number, height: number, box?: { x: number, y: number, width: number, height: number }): Promise<string> {
+async function captureImage(frameData: Uint8ClampedArray, width: number, height: number, box?: { x: number, y: number, width: number, height: number }): Promise<Blob> {
     let cropX = 0, cropY = 0, cropW = width, cropH = height;
     if (box) {
         cropX = Math.max(0, Math.floor(box.x));
@@ -352,33 +352,30 @@ async function captureImage(frameData: Uint8ClampedArray, width: number, height:
 
     const canvas = new OffscreenCanvas(cropW, cropH);
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
-    if (!ctx) return '';
+    if (!ctx) throw new Error('Canvas context unavailable');
 
     ctx.imageSmoothingEnabled = false;
     ctx.putImageData(new ImageData(croppedData, cropW, cropH), 0, 0);
 
-    const blob = await canvas.convertToBlob({ type: "image/png" });
-    return new Promise((resolve) => {
-        const reader = new FileReader();
-        reader.onloadend = () => {
-            console.log("[Worker] Capture successful, size:", Math.round((blob.size / 1024)) + "KB");
-            resolve(reader.result as string);
-        };
-        reader.readAsDataURL(blob);
+    const blob = await canvas.convertToBlob({ 
+        type: "image/webp", 
+        quality: 1.0  // 100% quality
     });
+    
+    console.log("[Worker] Capture successful, size:", Math.round((blob.size / 1024)) + "KB");
+    return blob;
 }
 
-async function captureWarpedImage(imageData: ImageData): Promise<string> {
+async function captureWarpedImage(imageData: ImageData): Promise<Blob> {
     const canvas = new OffscreenCanvas(imageData.width, imageData.height);
     const ctx = canvas.getContext('2d', { hideFromRaw: true } as any);
-    if (!ctx) return '';
+    if (!ctx) throw new Error('Canvas context unavailable');
     ctx.imageSmoothingEnabled = false;
     ctx.putImageData(imageData, 0, 0);
-    const blob = await canvas.convertToBlob({ type: "image/png" });
-    return new Promise((resolve) => {
-        const reader = new FileReader();
-        reader.onloadend = () => resolve(reader.result as string);
-        reader.readAsDataURL(blob);
+    
+    return await canvas.convertToBlob({ 
+        type: "image/webp", 
+        quality: 1.0  // 100% quality
     });
 }
 

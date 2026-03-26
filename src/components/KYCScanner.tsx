@@ -12,6 +12,8 @@ export default function KYCScanner() {
     transitionStage,
     capturedId,
     capturedFace,
+    capturedIdBlob,
+    capturedFaceBlob,
     isMocking,
     forceCapture,
     progress,

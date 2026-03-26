@@ -17,6 +17,8 @@ export const useKYCPipeline = () => {
 
     const [capturedId, setCapturedId] = useState<string | null>(null);
     const [capturedFace, setCapturedFace] = useState<string | null>(null);
+    const [capturedIdBlob, setCapturedIdBlob] = useState<Blob | null>(null);
+    const [capturedFaceBlob, setCapturedFaceBlob] = useState<Blob | null>(null);
     const [boundingBox, setBoundingBox] = useState<BoundingBox | null>(null);
     const [isMocking, setIsMocking] = useState(false);
     const [progress, setProgress] = useState(0);
@@ -50,10 +52,14 @@ export const useKYCPipeline = () => {
             if (e.data.capturedImage) {
                 console.log(`[Main] Image Received for stage: ${e.data.stage}`);
                 if (e.data.stage === KYCStage.ID_CAPTURE) {
-                    setCapturedId(e.data.capturedImage);
+                    setCapturedIdBlob(e.data.capturedImage);
+                    const objectUrl = URL.createObjectURL(e.data.capturedImage);
+                    setCapturedId(objectUrl);
                     setCurrentStage(KYCStage.FACE_CAPTURE);
                 } else if (e.data.stage === KYCStage.FACE_CAPTURE) {
-                    setCapturedFace(e.data.capturedImage);
+                    setCapturedFaceBlob(e.data.capturedImage);
+                    const objectUrl = URL.createObjectURL(e.data.capturedImage);
+                    setCapturedFace(objectUrl);
                     setCurrentStage(KYCStage.DONE);
                 }
             }
@@ -71,6 +77,9 @@ export const useKYCPipeline = () => {
 
         return () => {
             console.log("[Main] Terminating Worker...");
+            // Clean up object URLs to prevent memory leaks
+            if (capturedId) URL.revokeObjectURL(capturedId);
+            if (capturedFace) URL.revokeObjectURL(capturedFace);
             worker.terminate();
         }
     }, []);
@@ -269,14 +278,21 @@ export const useKYCPipeline = () => {
     const resetFlow = useCallback(() => {
         console.log("[Main] Resetting KYC flow to PRE_FLIGHT");
         isProcessingWorker.current = false;
+        
+        // Clean up object URLs before resetting
+        if (capturedId) URL.revokeObjectURL(capturedId);
+        if (capturedFace) URL.revokeObjectURL(capturedFace);
+        
         setCapturedId(null);
         setCapturedFace(null);
+        setCapturedIdBlob(null);
+        setCapturedFaceBlob(null);
         setBoundingBox(null);
         setProgress(0);
         setIsReady(false);
         setFeedback("Initializing...");
         setCurrentStage(KYCStage.PRE_FLIGHT);
-    }, []);
+    }, [capturedId, capturedFace]);
 
-    return { videoRef, hiddenCanvasRef, overlayCanvasRef, currentStage, feedback, isReadyForNextStage, transitionStage, capturedId, capturedFace, isMocking, forceCapture, progress, isMirrored, resetFlow };
+    return { videoRef, hiddenCanvasRef, overlayCanvasRef, currentStage, feedback, isReadyForNextStage, transitionStage, capturedId, capturedFace, capturedIdBlob, capturedFaceBlob, isMocking, forceCapture, progress, isMirrored, resetFlow };
 };

@@ -15,7 +15,7 @@ export type WorkerMessage = {
   feedback: string;
   isReady: boolean;
   boundingBox?: BoundingBox | null;
-  capturedImage?: string | null;
+  capturedImage?: Blob | null;
   isMocking?: boolean;
   progress?: number;
 };
