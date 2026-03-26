@@ -44,7 +44,7 @@ const CONFIG = {
     YOLO_CONFIDENCE: 0.15,    // Minimum confidence score — kept low so close-up shots (where YOLO loses background context) still fire
     MAX_PROCESSING_MS: 150,   // Target max frame processing time (ms) — skip frames if exceeded
     ID_MIN_WIDTH_RATIO: 0.38, // ID must take up at least 38% of the frame width (closer to camera)
-    ID_MIN_WIDTH_RATIO_MOBILE: 0.42, // ID must take up at least 42% of the frame width on mobile (stricter to avoid false positives)
+    ID_MIN_WIDTH_RATIO_MOBILE: 0.42, // Legacy mobile threshold - now using desktop ratio (0.38) for all devices
     ID_MAX_DIST_CENTER: 0.95,  // Maximum distance from center
     ID_ASPECT_RATIO: 1.58,    // Standard ID card aspect ratio (width/height)
     ID_ASPECT_TOLERANCE: 0.40, // Wide tolerance — close-up perspective distortion skews the ratio
@@ -422,7 +422,7 @@ function findIDCardBoundingBox(data: Uint8ClampedArray, width: number, height: n
     // Final validation: check if the box is too small relative to frame (minimum size)
     const widthRatio = finalBox.width / width;
     const heightRatio = finalBox.height / height;
-    if (widthRatio < CONFIG.ID_MIN_WIDTH_RATIO_MOBILE || heightRatio < (CONFIG.ID_MIN_WIDTH_RATIO_MOBILE / CONFIG.ID_ASPECT_RATIO)) {
+    if (widthRatio < CONFIG.ID_MIN_WIDTH_RATIO || heightRatio < (CONFIG.ID_MIN_WIDTH_RATIO / CONFIG.ID_ASPECT_RATIO)) {
         return null;
     }
 
@@ -709,8 +709,8 @@ self.onmessage = async (e: MessageEvent) => {
             let isReady = false;
             let capturedImage = null;
 
-            // Skip YOLO on mobile devices to save performance - use lightweight edge detection instead
-            const useYOLO = yoloModel && !isMobileDevice;
+            // Use smaller YOLO model on mobile (320px) for better performance while maintaining accuracy
+            const useYOLO = !!yoloModel;
             
             if (useYOLO) {
                 try {
@@ -880,7 +880,8 @@ self.onmessage = async (e: MessageEvent) => {
                             const isVertical = Math.abs(ratio - (1 / CONFIG.ID_ASPECT_RATIO)) < CONFIG.ID_ASPECT_TOLERANCE;
                             const distToCenter = Math.sqrt(Math.pow(cx - width / 2, 2) + Math.pow(cy - height / 2, 2));
 
-                            const minWidthRatio = isMobileDevice ? CONFIG.ID_MIN_WIDTH_RATIO_MOBILE : CONFIG.ID_MIN_WIDTH_RATIO;
+                            // Use desktop width ratio (0.38) for all devices - more comfortable distance
+                            const minWidthRatio = CONFIG.ID_MIN_WIDTH_RATIO;
 
                             if (!isHorizontal && !isVertical) {
                                 feedback = "Align ID directly to the frame.";
