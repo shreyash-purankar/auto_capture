@@ -36,7 +36,7 @@ const CONFIG = {
     // Pre-Flight Checks
     MIN_BRIGHTNESS: 60,       // Minimum average pixel intensity (0-255)
     MAX_BRIGHTNESS: 240,      // Maximum average pixel intensity (0-255)
-    MIN_GLOBAL_VARIANCE: 15,  // Minimum Laplacian variance for the entire frame (lowered for faster transition)
+    MIN_GLOBAL_VARIANCE: 8,  // Minimum Laplacian variance for the entire frame (lowered for faster transition)
 
     // ID Capture (YOL & OpenCV)
     YOLO_SIZE: 640,           // Input size for YOLOv11 (FIXED - model requires 640x640)

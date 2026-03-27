@@ -44,7 +44,7 @@ const blobToBase64 = (blob: Blob): Promise<string> => {
 
 // Helper function to ensure blob is a valid image
 const ensureValidImageBlob = async (blob: Blob, filename: string): Promise<Blob> => {
-  console.log(`[ensureValidImageBlob] Processing ${filename}, original size: ${blob.size}, type: ${blob.type}`);
+  // console.log(`[ensureValidImageBlob] Processing ${filename}, original size: ${blob.size}, type: ${blob.type}`);
   
   try {
     // Create a canvas and draw the image
@@ -74,7 +74,7 @@ const ensureValidImageBlob = async (blob: Blob, filename: string): Promise<Blob>
               reject(new Error('Failed to convert canvas to blob'));
               return;
             }
-            console.log(`[ensureValidImageBlob] Successfully converted ${filename} to JPEG, new size: ${jpegBlob.size}, type: ${jpegBlob.type}`);
+            // console.log(`[ensureValidImageBlob] Successfully converted ${filename} to JPEG, new size: ${jpegBlob.size}, type: ${jpegBlob.type}`);
             resolve(jpegBlob);
           },
           'image/jpeg',
@@ -90,7 +90,7 @@ const ensureValidImageBlob = async (blob: Blob, filename: string): Promise<Blob>
       img.src = url;
     });
   } catch (err) {
-    console.error(`[ensureValidImageBlob] Error converting ${filename}:`, err);
+    // console.error(`[ensureValidImageBlob] Error converting ${filename}:`, err);
     // If conversion fails, return original blob
     return blob;
   }
@@ -98,9 +98,9 @@ const ensureValidImageBlob = async (blob: Blob, filename: string): Promise<Blob>
 
 export const useVerifyFace = (options: UseVerifyFaceOptions = {}) => {
   const {
-    bearerToken = 'a1ccef123762795909edf8cf905ab3c4',
-    similarityThreshold = '75',
-    imageType = '1',
+    bearerToken = (import.meta as any).env.VITE_AADRILA_BEARER_TOKEN || '',
+    similarityThreshold = (import.meta as any).env.VITE_SIMILARITY_THRESHOLD || '75',
+    imageType = (import.meta as any).env.VITE_IMAGE_TYPE || '1',
   } = options;
 
   const [loading, setLoading] = useState(false);
@@ -118,9 +118,9 @@ export const useVerifyFace = (options: UseVerifyFaceOptions = {}) => {
 
       try {
         // Ensure blobs are valid image files
-        console.log('[useVerifyFace] Processing images...');
-        console.log('[useVerifyFace] Doc file blob size:', docFileBlob.size, 'type:', docFileBlob.type);
-        console.log('[useVerifyFace] User photo blob size:', userPhotoBlob.size, 'type:', userPhotoBlob.type);
+        // console.log('[useVerifyFace] Processing images...');
+        // console.log('[useVerifyFace] Doc file blob size:', docFileBlob.size, 'type:', docFileBlob.type);
+        // console.log('[useVerifyFace] User photo blob size:', userPhotoBlob.size, 'type:', userPhotoBlob.type);
 
         const docFile = await ensureValidImageBlob(docFileBlob, 'id_document.jpg');
         const userPhoto = await ensureValidImageBlob(userPhotoBlob, 'face_photo.jpg');
@@ -129,13 +129,13 @@ export const useVerifyFace = (options: UseVerifyFaceOptions = {}) => {
         const docFileBase64 = await blobToBase64(docFile);
         const userPhotoBase64 = await blobToBase64(userPhoto);
 
-        console.log('[useVerifyFace] Converted to base64, sending to proxy endpoint');
-        console.log('[useVerifyFace] Parameters:', {
-          SimilarityThreshold: similarityThreshold,
-          ImageType: imageType,
-          docFileSize: docFile.size,
-          userPhotoSize: userPhoto.size,
-        });
+        // console.log('[useVerifyFace] Converted to base64, sending to proxy endpoint');
+        // console.log('[useVerifyFace] Parameters:', {
+        //   SimilarityThreshold: similarityThreshold,
+        //   ImageType: imageType,
+        //   docFileSize: docFile.size,
+        //   userPhotoSize: userPhoto.size,
+        // });
 
         // Call the proxy endpoint instead of the API directly (solves CORS)
         const proxyUrl = '/api/verify-face';
@@ -155,14 +155,14 @@ export const useVerifyFace = (options: UseVerifyFaceOptions = {}) => {
 
         if (!response.ok) {
           const errorData = await response.text();
-          console.error('[useVerifyFace] Proxy Error Response:', errorData);
+          // console.error('[useVerifyFace] Proxy Error Response:', errorData);
           throw new Error(
             `API Error: ${response.status} - ${errorData || response.statusText}`
           );
         }
 
         const data = await response.json();
-        console.log('[useVerifyFace] API Response:', data);
+        // console.log('[useVerifyFace] API Response:', data);
 
         // Normalize API response to standard format
         const normalizedResponse: VerifyFaceResponse = {
@@ -178,7 +178,7 @@ export const useVerifyFace = (options: UseVerifyFaceOptions = {}) => {
           const faceMatchScore = parseFloat(apiData.face_match_score || '0');
           const threshold = parseFloat(apiData.threshold || '75');
           
-          console.log('[useVerifyFace] Extracted face_match_score:', faceMatchScore, 'threshold:', threshold);
+          // console.log('[useVerifyFace] Extracted face_match_score:', faceMatchScore, 'threshold:', threshold);
           
           // Determine success based on status and threshold
           const isSuccess = apiData.status === 1 && faceMatchScore >= threshold;
@@ -191,12 +191,12 @@ export const useVerifyFace = (options: UseVerifyFaceOptions = {}) => {
             ? `Face match successful! Score: ${faceMatchScore.toFixed(2)}%`
             : `Face match failed. Score: ${faceMatchScore.toFixed(2)}% (Required: ${threshold}%)`;
           
-          console.log('[useVerifyFace] Normalized response:', {
-            success: normalizedResponse.success,
-            similarity: normalizedResponse.similarity,
-            matchStatus: normalizedResponse.matchStatus,
-            message: normalizedResponse.message,
-          });
+          // console.log('[useVerifyFace] Normalized response:', {
+          //   success: normalizedResponse.success,
+          //   similarity: normalizedResponse.similarity,
+          //   matchStatus: normalizedResponse.matchStatus,
+          //   message: normalizedResponse.message,
+          // });
         } else if (data.success !== undefined) {
           // Handle standard API format
           normalizedResponse.success = data.success;
@@ -211,7 +211,7 @@ export const useVerifyFace = (options: UseVerifyFaceOptions = {}) => {
         return normalizedResponse;
       } catch (err) {
         const errorMessage = err instanceof Error ? err.message : 'Unknown error occurred';
-        console.error('[useVerifyFace] Error:', errorMessage);
+        // console.error('[useVerifyFace] Error:', errorMessage);
         setError(errorMessage);
         setLoading(false);
         return null;

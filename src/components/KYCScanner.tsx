@@ -36,7 +36,7 @@ export default function KYCScanner() {
         capturedFaceBlob !== prevBlobsRef.current.face;
       
       if (blobsChanged) {
-        console.log("[KYCScanner] New images captured - verification state cleared, verify button visible");
+        // console.log("[KYCScanner] New images captured - verification state cleared, verify button visible");
         resetVerification();
         prevBlobsRef.current = { id: capturedIdBlob, face: capturedFaceBlob };
       }
@@ -46,7 +46,7 @@ export default function KYCScanner() {
   // Handle manual verification
   const handleVerifyClick = async () => {
     if (capturedIdBlob && capturedFaceBlob) {
-      console.log("[KYCScanner] User clicked verify button");
+      // console.log("[KYCScanner] User clicked verify button");
       await verifyFace(capturedIdBlob, capturedFaceBlob);
     }
   };
