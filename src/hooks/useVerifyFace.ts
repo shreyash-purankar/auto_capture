@@ -23,11 +23,24 @@ export interface VerifyFaceResponse {
 }
 
 interface UseVerifyFaceOptions {
-  apiUrl?: string;
   bearerToken?: string;
   similarityThreshold?: string;
   imageType?: string;
 }
+
+// Helper function to convert blob to base64
+const blobToBase64 = (blob: Blob): Promise<string> => {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const result = reader.result as string;
+      const base64 = result.split(',')[1]; // Remove data:image/jpeg;base64, prefix
+      resolve(base64);
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+};
 
 // Helper function to ensure blob is a valid image
 const ensureValidImageBlob = async (blob: Blob, filename: string): Promise<Blob> => {
@@ -85,7 +98,6 @@ const ensureValidImageBlob = async (blob: Blob, filename: string): Promise<Blob>
 
 export const useVerifyFace = (options: UseVerifyFaceOptions = {}) => {
   const {
-    apiUrl = 'https://uat.aadrila.com/api/v1/verify-face',
     bearerToken = 'a1ccef123762795909edf8cf905ab3c4',
     similarityThreshold = '75',
     imageType = '1',
@@ -113,14 +125,11 @@ export const useVerifyFace = (options: UseVerifyFaceOptions = {}) => {
         const docFile = await ensureValidImageBlob(docFileBlob, 'id_document.jpg');
         const userPhoto = await ensureValidImageBlob(userPhotoBlob, 'face_photo.jpg');
 
-        // Create FormData with the required parameters
-        const formData = new FormData();
-        formData.append('docFile', docFile, 'id_document.jpg');
-        formData.append('user_photo', userPhoto, 'face_photo.jpg');
-        formData.append('SimilarityThreshold', String(similarityThreshold));
-        formData.append('ImageType', String(imageType));
+        // Convert blobs to base64 for proxy API
+        const docFileBase64 = await blobToBase64(docFile);
+        const userPhotoBase64 = await blobToBase64(userPhoto);
 
-        console.log('[useVerifyFace] Sending request to:', apiUrl);
+        console.log('[useVerifyFace] Converted to base64, sending to proxy endpoint');
         console.log('[useVerifyFace] Parameters:', {
           SimilarityThreshold: similarityThreshold,
           ImageType: imageType,
@@ -128,17 +137,25 @@ export const useVerifyFace = (options: UseVerifyFaceOptions = {}) => {
           userPhotoSize: userPhoto.size,
         });
 
-        const response = await fetch(apiUrl, {
+        // Call the proxy endpoint instead of the API directly (solves CORS)
+        const proxyUrl = '/api/verify-face';
+        const response = await fetch(proxyUrl, {
           method: 'POST',
           headers: {
-            'Authorization': `Bearer ${bearerToken}`,
+            'Content-Type': 'application/json',
           },
-          body: formData,
+          body: JSON.stringify({
+            docFileBase64,
+            userPhotoBase64,
+            bearerToken,
+            similarityThreshold,
+            imageType,
+          }),
         });
 
         if (!response.ok) {
           const errorData = await response.text();
-          console.error('[useVerifyFace] API Error Response:', errorData);
+          console.error('[useVerifyFace] Proxy Error Response:', errorData);
           throw new Error(
             `API Error: ${response.status} - ${errorData || response.statusText}`
           );
@@ -200,7 +217,7 @@ export const useVerifyFace = (options: UseVerifyFaceOptions = {}) => {
         return null;
       }
     },
-    [apiUrl, bearerToken, similarityThreshold, imageType]
+    [bearerToken, similarityThreshold, imageType]
   );
 
   const reset = useCallback(() => {
