@@ -7,6 +7,9 @@ export const useKYCPipeline = () => {
     const hiddenCanvasRef = useRef<HTMLCanvasElement>(null);
     const overlayCanvasRef = useRef<HTMLCanvasElement>(null);
     const workerRef = useRef<Worker | null>(null);
+    
+    // Stream ref for constraint switching optimization
+    const streamRef = useRef<MediaStream | null>(null);
 
     // --- ADD THE LOCK ---
     const isProcessingWorker = useRef<boolean>(false);
@@ -80,6 +83,12 @@ export const useKYCPipeline = () => {
             // Clean up object URLs to prevent memory leaks
             if (capturedId) URL.revokeObjectURL(capturedId);
             if (capturedFace) URL.revokeObjectURL(capturedFace);
+            // Clean up camera stream
+            if (streamRef.current) {
+                console.log("[Main] Stopping Camera Tracks on component unmount.");
+                streamRef.current.getTracks().forEach(track => track.stop());
+                streamRef.current = null;
+            }
             worker.terminate();
         }
     }, []);
@@ -87,12 +96,14 @@ export const useKYCPipeline = () => {
     // Track Stage Transitions
     useEffect(() => {
         console.log(`[Main] Stage transitioned to: ${currentStage}`);
+        // Reset worker lock on stage transition to prevent stale state blocking new frames
+        isProcessingWorker.current = false;
     }, [currentStage]);
 
     // Initialize Camera Stream
     useEffect(() => {
-        let stream: MediaStream | null = null;
         let isMounted = true;
+        
         const startCamera = async () => {
             console.log("[Main] Requesting Camera Permissions...");
             
@@ -131,16 +142,43 @@ export const useKYCPipeline = () => {
                     aspectRatio: { ideal: 1.7777777778 } // 16:9
                 };
 
-                stream = await navigator.mediaDevices.getUserMedia({
-                    video: videoConstraints
-                });
+                // Try constraint switching optimization for mobile devices
+                let stream = streamRef.current;
+                let constraintSwitchSucceeded = false;
+                
+                if (mobile && stream && stream.active) {
+                    const videoTrack = stream.getVideoTracks()[0];
+                    if (videoTrack) {
+                        try {
+                            console.log(`[Main] Attempting constraint switch to ${facingMode}...`);
+                            await videoTrack.applyConstraints({ facingMode });
+                            constraintSwitchSucceeded = true;
+                            console.log(`[Main] Constraint switch successful (${facingMode})`);
+                        } catch (constraintError) {
+                            console.warn("[Main] Constraint switching not supported, falling back to new stream:", constraintError);
+                            // Stop existing stream before requesting new one
+                            stream.getTracks().forEach(track => track.stop());
+                            stream = null;
+                            streamRef.current = null;
+                        }
+                    }
+                }
+                
+                // If constraint switching didn't work or no existing stream, get new stream
+                if (!constraintSwitchSucceeded) {
+                    stream = await navigator.mediaDevices.getUserMedia({
+                        video: videoConstraints
+                    });
+                    streamRef.current = stream;
+                }
+                
                 if (isMounted && videoRef.current) {
                     videoRef.current.srcObject = stream;
                     console.log(`[Main] Camera access granted (${facingMode}) and stream attached.`);
                 } else if (stream) {
                     // Component unmounted before stream was attached — release immediately
                     stream.getTracks().forEach(track => track.stop());
-                    stream = null;
+                    streamRef.current = null;
                 }
             } catch (e) {
                 console.error("[Main] Camera Access Failed:", e);
@@ -151,10 +189,8 @@ export const useKYCPipeline = () => {
 
         return () => {
             isMounted = false;
-            if (stream) {
-                console.log("[Main] Stopping Camera Tracks.");
-                stream.getTracks().forEach(track => track.stop());
-            }
+            // Don't stop stream on cleanup - keep it alive for constraint switching
+            // Only stop on component unmount (handled in main cleanup useEffect)
         };
     }, [currentStage, isMobile]);
 
@@ -282,6 +318,12 @@ export const useKYCPipeline = () => {
         // Clean up object URLs before resetting
         if (capturedId) URL.revokeObjectURL(capturedId);
         if (capturedFace) URL.revokeObjectURL(capturedFace);
+        
+        // Clean up camera stream to force fresh start
+        if (streamRef.current) {
+            streamRef.current.getTracks().forEach(track => track.stop());
+            streamRef.current = null;
+        }
         
         setCapturedId(null);
         setCapturedFace(null);
