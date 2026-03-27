@@ -41,6 +41,17 @@ export const useKYCPipeline = () => {
             // --- RELEASE THE LOCK WHEN WORKER RESPONDS ---
             isProcessingWorker.current = false;
 
+            // Skip frames are only for releasing the lock, don't update UI
+            if ((e.data as any).skipMessage) {
+                console.log(`[Main] ⏭️  Received skip message, lock released but UI unchanged`);
+                return;
+            }
+
+            const stage = e.data.stage;
+            if (stage === KYCStage.ID_CAPTURE || stage === KYCStage.FACE_CAPTURE) {
+                console.log(`[Main] 📨 Received FRAME_RESULT: stage=${stage}, isReady=${e.data.isReady}, feedback="${e.data.feedback}", progress=${(e.data.progress || 0).toFixed(2)}`);
+            }
+            
             setFeedback(e.data.feedback);
             setIsReady(e.data.isReady);
             setBoundingBox(e.data.boundingBox || null);
@@ -86,7 +97,7 @@ export const useKYCPipeline = () => {
 
     // Track Stage Transitions
     useEffect(() => {
-        console.log(`[Main] Stage transitioned to: ${currentStage}`);
+        console.log(`[Main] 📍 STAGE CHANGED TO: ${currentStage}`);
     }, [currentStage]);
 
     // Initialize Camera Stream
@@ -177,7 +188,7 @@ export const useKYCPipeline = () => {
             throttleMs = isHighEnd ? 33 : 100; // 30fps for desktop high-end, 10fps for low-end
         }
         
-        console.log(`[Main] Performance Tier: isHighEnd=${isHighEnd}, mobile=${mobile}, throttleMs=${throttleMs}ms`);
+        console.log(`[Main] Processing Loop for Stage ${currentStage}: isHighEnd=${isHighEnd}, mobile=${mobile}, throttleMs=${throttleMs}ms`);
 
         const processFrame = async (timestamp: number) => {
             // Check throttle AND ensure worker is NOT busy
@@ -199,6 +210,9 @@ export const useKYCPipeline = () => {
                         isProcessingWorker.current = true;
 
                         const mobile = isMobile();
+                        if (currentStage === KYCStage.ID_CAPTURE || currentStage === KYCStage.FACE_CAPTURE) {
+                            console.log(`[Main] 📤 Sending frame to worker: stage=${currentStage}, size=${video.videoWidth}x${video.videoHeight}`);
+                        }
                         workerRef.current.postMessage({
                             stage: currentStage,
                             bitmap: bitmap,
@@ -263,9 +277,12 @@ export const useKYCPipeline = () => {
     }, [boundingBox, currentStage, isReadyForNextStage, progress]);
 
     const transitionStage = useCallback(() => {
+        console.log(`[Main] transitionStage called, currentStage=${currentStage}`);
         if (currentStage === KYCStage.PRE_FLIGHT) {
-            console.log("[Main] User triggered stage transition to ID_CAPTURE");
+            console.log("[Main] ✅ Transitioning PRE_FLIGHT → ID_CAPTURE");
             setCurrentStage(KYCStage.ID_CAPTURE);
+        } else {
+            console.warn(`[Main] ❌ Cannot transition from ${currentStage}, only PRE_FLIGHT is valid`);
         }
     }, [currentStage]);
 

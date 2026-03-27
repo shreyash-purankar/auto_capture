@@ -54,18 +54,20 @@ const CONFIG = {
     ID_MIN_VARIANCE_MOBILE: 45, // Lower variance threshold for mobile (but with stricter shape validation)
     ID_MIN_TEXTURE_VARIANCE: 300, // Minimum texture variance inside the ID region (cards have text/images)
     ID_MIN_EDGE_DENSITY: 0.015, // Minimum edge pixel ratio for valid ID detection (1.5% of pixels should be edges)
-    ID_STABILITY_TOLERANCE: 0.25, // Maximum allowed movement between frames
+    ID_STABILITY_TOLERANCE: 0.12, // Maximum allowed movement between frames (desktop - tightened for better stability)
+    ID_STABILITY_TOLERANCE_MOBILE: 0.25, // Maximum allowed movement between frames (mobile - more forgiving due to frame skipping)
     ID_CAPTURE_FRAMES: 15,    // Number of consecutive stable frames required to auto-capture
+    ID_HYSTERESIS_THRESHOLD: 8, // Increased buffer on mobile to prevent ready-state flickering with frame skipping
 
 
     // Face Capture (MediaPipe)
     FACE_MIN_WIDTH_RATIO: 0.25, // Face must take up at least 25% of the frame width (desktop)
-    FACE_MIN_WIDTH_RATIO_MOBILE: 0.15, // Face must take up at least 15% of the frame width (mobile - more comfortable distance)
+    FACE_MIN_WIDTH_RATIO_MOBILE: 0.10, // Face must take up at least 10% of the frame width (mobile - relaxed for low-end devices)
     FACE_CENTER_TOLERANCE: 0.25, // Face must be within 25% of the center
     FACE_CENTER_TOLERANCE_MOBILE: 0.25, // Face must be within 30% of the center (mobile - more forgiving)
     FACE_MIN_EAR: 0.2,        // Minimum Eye Aspect Ratio (openness)
-    FACE_MAX_GAZE_OFFSET: 0.1, // Maximum gaze offset from center
-    FACE_MAX_POSE_ANGLE: 0.2, // Maximum head pose angle (yaw/pitch in radians)
+    FACE_MAX_GAZE_OFFSET: 0.125, // Maximum gaze offset from center (relaxed for mobile)
+    FACE_MAX_POSE_ANGLE: 0.25, // Maximum head pose angle (yaw/pitch in radians, relaxed for mobile)
     FACE_MIN_VARIANCE: 20,    // Minimum Laplacian variance for the face crop (lowered to 40 as requested)
     FACE_CAPTURE_FRAMES: 20,  // Number of consecutive stable frames required to auto-capture
 };
@@ -83,17 +85,19 @@ if (tfGlobal && typeof tfGlobal.btoa !== 'function') {
 }
 
 // Apply exponential moving average to smooth bounding box jitter between frames
-const EMA_ALPHA = 0.35;
+// Mobile uses lower alpha (0.25) for smoother transitions, desktop uses 0.35
 function applyEMA(
     prev: { x: number; y: number; width: number; height: number } | null,
-    next: { x: number; y: number; width: number; height: number }
+    next: { x: number; y: number; width: number; height: number },
+    isMobile: boolean = false
 ): { x: number; y: number; width: number; height: number } {
     if (!prev) return { ...next };
+    const alpha = isMobile ? 0.25 : 0.35; // Gentler smoothing for mobile
     return {
-        x: prev.x + EMA_ALPHA * (next.x - prev.x),
-        y: prev.y + EMA_ALPHA * (next.y - prev.y),
-        width: prev.width + EMA_ALPHA * (next.width - prev.width),
-        height: prev.height + EMA_ALPHA * (next.height - prev.height),
+        x: prev.x + alpha * (next.x - prev.x),
+        y: prev.y + alpha * (next.y - prev.y),
+        width: prev.width + alpha * (next.width - prev.width),
+        height: prev.height + alpha * (next.height - prev.height),
     };
 }
 
@@ -628,6 +632,7 @@ self.onmessage = async (e: MessageEvent) => {
         return;
     }
     const { type, bitmap, width, height, stage, tier, isMobile } = e.data;
+    console.log(`[Worker] Received: type=${type}, stage=${stage}, isMobile=${isMobile}`);
 
     // Capture mobile device flag
     if (isMobile !== undefined) {
@@ -658,6 +663,7 @@ self.onmessage = async (e: MessageEvent) => {
         };
 
         if (stage === KYCStage.PRE_FLIGHT) {
+            console.log('[Worker] 🎬 Executing PRE_FLIGHT stage checks');
             const imageData = getImageData(bitmap, width, height);
             const frameData = imageData.data;
             let brightnessSum = 0;
@@ -689,6 +695,7 @@ self.onmessage = async (e: MessageEvent) => {
         }
 
         else if (stage === KYCStage.ID_CAPTURE) {
+            console.log('[Worker] 🎬 Executing ID_CAPTURE stage');
             // Track stage transitions to optimize initial frames
             const now = performance.now();
             const isNewStage = (now - stageTransitionTimestamp) > 1000; // New stage if >1s since last
@@ -722,24 +729,27 @@ self.onmessage = async (e: MessageEvent) => {
                     skipCounter++;
                     const mobileSkipRate = isMobileDevice ? Math.max(frameSkipRate, 2) : frameSkipRate;
                     if (skipCounter % mobileSkipRate !== 0) {
-                        // Skip this frame - but MUST send a response to unlock the main thread
-                        // Reuse the last feedback and bounding box to keep UI responsive
-                        const progress = isReady ? Math.min(1, captureTimer / CONFIG.ID_CAPTURE_FRAMES) : 0;
+                        console.log(`[Worker] ⏭️  Skipping frame ${skipCounter} (skip rate: 1/${mobileSkipRate})`);
+                        // Send message to release lock, but mark as skip so UI ignores it
+                        const lastProgress = isReady ? Math.min(1, captureTimer / CONFIG.ID_CAPTURE_FRAMES) : 0;
                         self.postMessage({ 
                             type: 'FRAME_RESULT', 
                             stage, 
-                            feedback: lastFeedbackText || "Analyzing ID...", 
-                            isReady, 
-                            boundingBox: smoothedBoundingBox, 
+                            feedback: lastFeedbackText || "Analyzing ID...",
+                            isReady: false,
+                            boundingBox: null,
                             capturedImage: null, 
                             isMocking: false, 
-                            progress 
+                            progress: lastProgress,
+                            skipMessage: true  // Flag: UI should ignore this
                         });
                         return;
                     }
+                    console.log(`[Worker] ▶️  Processing frame ${skipCounter} (skip rate: 1/${mobileSkipRate})`);
                     
                     const frameStartTime = performance.now();
-                    // YOLO model requires 640x640 input - cannot use smaller size
+                    // YOLO model has fixed 640x640 input shape - cannot use variable sizes
+                    // Mobile optimization relies on frame skipping instead (see frameSkipRate above)
                     const yoloInputSize = CONFIG.YOLO_SIZE;
                     
                     // --- LETTERBOX: pad the 16:9 frame to a square so YOLO sees undistorted geometry ---
@@ -863,13 +873,16 @@ self.onmessage = async (e: MessageEvent) => {
                         // When the card is close it fills the frame; YOLO loses background context
                         // and confidence drops well below YOLO_CONFIDENCE. Check the box size first
                         // and bypass the confidence gate so close-up captures still work.
-                        const cardFillsFrame = w >= width * 0.65 || h >= height * 0.65;
+                        const cardFillsFrame = w >= width * 0.80 || h >= height * 0.80;
                         let proceedToQualityCheck = false;
 
                         if (cardFillsFrame) {
-                            const inset = Math.min(width, height) * 0.02;
-                            const rawBox = { x: inset, y: inset, width: width - inset * 2, height: height - inset * 2 };
-                            smoothedBoundingBox = applyEMA(smoothedBoundingBox, rawBox);
+                            // Use actual YOLO box edges instead of screen-filling inset
+                            // This ensures bounding box accurately tracks the card even when close
+                            const adjW = w * CONFIG.ID_BOX_EXPAND_FACTOR;
+                            const adjH = h * CONFIG.ID_BOX_EXPAND_FACTOR;
+                            const rawBox = { x: cx - adjW / 2, y: cy - adjH / 2, width: adjW, height: adjH };
+                            smoothedBoundingBox = applyEMA(smoothedBoundingBox, rawBox, isMobileDevice);
                             boundingBox = smoothedBoundingBox;
                             proceedToQualityCheck = true;
                         } else if (score > CONFIG.YOLO_CONFIDENCE) {
@@ -878,7 +891,7 @@ self.onmessage = async (e: MessageEvent) => {
 
                             // Apply EMA smoothing to raw YOLO box before any quality checks
                             const rawBox = { x: cx - adjW / 2, y: cy - adjH / 2, width: adjW, height: adjH };
-                            smoothedBoundingBox = applyEMA(smoothedBoundingBox, rawBox);
+                            smoothedBoundingBox = applyEMA(smoothedBoundingBox, rawBox, isMobileDevice);
                             boundingBox = smoothedBoundingBox;
 
                             const ratio = w / h;
@@ -888,23 +901,58 @@ self.onmessage = async (e: MessageEvent) => {
 
                             // Use desktop width ratio (0.38) for all devices - more comfortable distance
                             const minWidthRatio = CONFIG.ID_MIN_WIDTH_RATIO;
+                            
+                            // Apply hysteresis to YOLO validation checks too (not just quality checks)
+                            const inYoloHysteresis = isMobileDevice && (captureTimer >= CONFIG.ID_HYSTERESIS_THRESHOLD);
 
                             if (!isHorizontal && !isVertical) {
-                                feedback = "Align ID directly to the frame.";
-                                captureTimer = Math.max(0, captureTimer - 2);
+                                if (!inYoloHysteresis) {
+                                    feedback = "Align ID directly to the frame.";
+                                    captureTimer = Math.max(0, captureTimer - 2);
+                                } else {
+                                    feedback = "Perfect. Hold steady...";
+                                    isReady = true;
+                                }
+                                // In hysteresis: keep previous box and proceed to quality check
+                                proceedToQualityCheck = inYoloHysteresis;
                             } else if (w < width * minWidthRatio) {
-                                feedback = "Bring the ID closer to the camera.";
-                                captureTimer = Math.max(0, captureTimer - 2);
+                                if (!inYoloHysteresis) {
+                                    feedback = "Bring the ID closer to the camera.";
+                                    captureTimer = Math.max(0, captureTimer - 2);
+                                } else {
+                                    feedback = "Perfect. Hold steady...";
+                                    isReady = true;
+                                }
+                                proceedToQualityCheck = inYoloHysteresis;
                             } else if (distToCenter > width * CONFIG.ID_MAX_DIST_CENTER) {
-                                feedback = "Center the ID in the frame.";
-                                captureTimer = Math.max(0, captureTimer - 2);
+                                if (!inYoloHysteresis) {
+                                    feedback = "Center the ID in the frame.";
+                                    captureTimer = Math.max(0, captureTimer - 2);
+                                } else {
+                                    feedback = "Perfect. Hold steady...";
+                                    isReady = true;
+                                }
+                                proceedToQualityCheck = inYoloHysteresis;
                             } else {
                                 proceedToQualityCheck = true;
                             }
                         } else {
                             // Low confidence and card is not close enough — no useful detection
-                            captureTimer = Math.max(0, captureTimer - 1);
-                            smoothedBoundingBox = null;
+                            // But if in hysteresis on mobile, keep previous box and forgive temporary YOLO glitch
+                            const inYoloHysteresis = isMobileDevice && (captureTimer >= CONFIG.ID_HYSTERESIS_THRESHOLD);
+                            if (!inYoloHysteresis) {
+                                captureTimer = Math.max(0, captureTimer - 1);
+                                smoothedBoundingBox = null;
+                            } else {
+                                // In hysteresis: stay green and keep feedback
+                                feedback = "Perfect. Hold steady...";
+                                isReady = true;
+                            }
+                            // In hysteresis: keep previous box, don't decrement, proceed to quality check
+                            proceedToQualityCheck = inYoloHysteresis && smoothedBoundingBox !== null;
+                            if (proceedToQualityCheck) {
+                                boundingBox = smoothedBoundingBox;
+                            }
                         }
 
                         if (proceedToQualityCheck) {
@@ -934,7 +982,7 @@ self.onmessage = async (e: MessageEvent) => {
                                         width: cvResult.tightBox.width,
                                         height: cvResult.tightBox.height
                                     };
-                                    smoothedBoundingBox = applyEMA(smoothedBoundingBox, refined);
+                                    smoothedBoundingBox = applyEMA(smoothedBoundingBox, refined, isMobileDevice);
                                     boundingBox = smoothedBoundingBox;
                                 }
 
@@ -1010,7 +1058,9 @@ self.onmessage = async (e: MessageEvent) => {
                                 if (previousBoundingBox) {
                                     const dx = Math.abs(boundingBox!.x - previousBoundingBox.x);
                                     const dy = Math.abs(boundingBox!.y - previousBoundingBox.y);
-                                    if (dx > width * CONFIG.ID_STABILITY_TOLERANCE || dy > height * CONFIG.ID_STABILITY_TOLERANCE) {
+                                    // Use mobile-specific stability tolerance (25% vs 12%) due to frame skipping
+                                    const stabilityTolerance = isMobileDevice ? CONFIG.ID_STABILITY_TOLERANCE_MOBILE : CONFIG.ID_STABILITY_TOLERANCE;
+                                    if (dx > width * stabilityTolerance || dy > height * stabilityTolerance) {
                                         isStableBox = false;
                                     }
                                 }
@@ -1021,22 +1071,27 @@ self.onmessage = async (e: MessageEvent) => {
                                 const textureThreshold = currentTier === 'low' ? CONFIG.ID_MIN_TEXTURE_VARIANCE * 0.7 : CONFIG.ID_MIN_TEXTURE_VARIANCE;
                                 const edgeThreshold = currentTier === 'low' ? CONFIG.ID_MIN_EDGE_DENSITY * 0.8 : CONFIG.ID_MIN_EDGE_DENSITY;
                                 
+                                // Hysteresis for MOBILE ONLY - once past threshold, forgive temporary variance/stability failures
+                                const inHysteresisZone = isMobileDevice && (captureTimer >= CONFIG.ID_HYSTERESIS_THRESHOLD);
+                                
                                 if (variance < varianceThreshold) {
-                                    feedback = "ID is blurry. Hold steady.";
-                                    isReady = false;
-                                    captureTimer = Math.max(0, captureTimer - 2);
+                                    feedback = inHysteresisZone ? "Perfect. Hold steady..." : "ID is blurry. Hold steady.";
+                                    isReady = inHysteresisZone; // Stay green in hysteresis zone
+                                    captureTimer = Math.max(inHysteresisZone ? CONFIG.ID_HYSTERESIS_THRESHOLD : 0, captureTimer - (inHysteresisZone ? 0 : 2)); // No decrement in hysteresis
                                 } else if (textureVariance < textureThreshold) {
-                                    feedback = "Can't see ID details. Adjust lighting or angle.";
-                                    isReady = false;
-                                    captureTimer = Math.max(0, captureTimer - 2);
+                                    // Apply hysteresis: forgive on occasional noise when in progress zone
+                                    feedback = inHysteresisZone ? "Perfect. Hold steady..." : "Can't see ID details. Adjust lighting or angle.";
+                                    isReady = inHysteresisZone;
+                                    captureTimer = Math.max(inHysteresisZone ? CONFIG.ID_HYSTERESIS_THRESHOLD : 0, captureTimer - (inHysteresisZone ? 0 : 1));
                                 } else if (edgeDensity < edgeThreshold) {
-                                    feedback = "Show a valid ID card.";
-                                    isReady = false;
-                                    captureTimer = Math.max(0, captureTimer - 2);
+                                    // Apply hysteresis: forgive on occasional noise when in progress zone
+                                    feedback = inHysteresisZone ? "Perfect. Hold steady..." : "Show a valid ID card.";
+                                    isReady = inHysteresisZone;
+                                    captureTimer = Math.max(inHysteresisZone ? CONFIG.ID_HYSTERESIS_THRESHOLD : 0, captureTimer - (inHysteresisZone ? 0 : 1));
                                 } else if (!isStableBox) {
-                                    feedback = "Hold ID still.";
-                                    isReady = false;
-                                    captureTimer = Math.max(0, captureTimer - 2);
+                                    feedback = inHysteresisZone ? "Perfect. Hold steady..." : "Hold ID still.";
+                                    isReady = inHysteresisZone; // Stay green in hysteresis zone
+                                    captureTimer = Math.max(inHysteresisZone ? CONFIG.ID_HYSTERESIS_THRESHOLD : 0, captureTimer - (inHysteresisZone ? 0 : 2)); // No decrement in hysteresis
                                 } else {
                                     feedback = "Perfect. Hold steady...";
                                     isReady = true;
@@ -1135,22 +1190,25 @@ self.onmessage = async (e: MessageEvent) => {
                         }
                         previousBoundingBox = { ...box };
 
+                        // Apply hysteresis to fallback path too - once at threshold, forgive all temporary failures
+                        const inHysteresisZone = isMobileDevice && (captureTimer >= CONFIG.ID_HYSTERESIS_THRESHOLD);
+
                         if (variance < CONFIG.ID_MIN_VARIANCE_MOBILE) {
-                            feedback = "ID is blurry. Hold steady.";
-                            isReady = false;
-                            captureTimer = Math.max(0, captureTimer - 2);
+                            feedback = inHysteresisZone ? "Perfect. Hold steady..." : "ID is blurry. Hold steady.";
+                            isReady = inHysteresisZone;
+                            captureTimer = Math.max(inHysteresisZone ? CONFIG.ID_HYSTERESIS_THRESHOLD : 0, captureTimer - (inHysteresisZone ? 0 : 1));
                         } else if (textureVariance < CONFIG.ID_MIN_TEXTURE_VARIANCE) {
-                            feedback = "Can't see ID details. Adjust lighting or angle.";
-                            isReady = false;
-                            captureTimer = Math.max(0, captureTimer - 2);
+                            feedback = inHysteresisZone ? "Perfect. Hold steady..." : "Can't see ID details. Adjust lighting or angle.";
+                            isReady = inHysteresisZone;
+                            captureTimer = Math.max(inHysteresisZone ? CONFIG.ID_HYSTERESIS_THRESHOLD : 0, captureTimer - (inHysteresisZone ? 0 : 1));
                         } else if (edgeDensity < CONFIG.ID_MIN_EDGE_DENSITY) {
-                            feedback = "Show a valid ID card.";
-                            isReady = false;
-                            captureTimer = Math.max(0, captureTimer - 2);
+                            feedback = inHysteresisZone ? "Perfect. Hold steady..." : "Show a valid ID card.";
+                            isReady = inHysteresisZone;
+                            captureTimer = Math.max(inHysteresisZone ? CONFIG.ID_HYSTERESIS_THRESHOLD : 0, captureTimer - (inHysteresisZone ? 0 : 1));
                         } else if (!isStableBox) {
-                            feedback = "Hold ID still.";
-                            isReady = false;
-                            captureTimer = Math.max(0, captureTimer - 2);
+                            feedback = inHysteresisZone ? "Perfect. Hold steady..." : "Hold ID still.";
+                            isReady = inHysteresisZone;
+                            captureTimer = Math.max(inHysteresisZone ? CONFIG.ID_HYSTERESIS_THRESHOLD : 0, captureTimer - (inHysteresisZone ? 0 : 1));
                         } else {
                             feedback = "Perfect. Hold steady...";
                             isReady = true;
@@ -1164,9 +1222,12 @@ self.onmessage = async (e: MessageEvent) => {
                 }
             }
 
-            // Calculate progress based on device tier (low-end devices have faster capture)
-            const captureThreshold = currentTier === 'low' ? CONFIG.ID_CAPTURE_FRAMES * 0.6 : CONFIG.ID_CAPTURE_FRAMES;
+            // Calculate progress based on device tier and mobile status
+            // Mobile: 8 frames (~270ms), Low-tier laptop: 9 frames, Desktop: 15 frames
+            const captureThreshold = isMobileDevice ? CONFIG.ID_CAPTURE_FRAMES * 0.53 : 
+                                     (currentTier === 'low' ? CONFIG.ID_CAPTURE_FRAMES * 0.6 : CONFIG.ID_CAPTURE_FRAMES);
             const progress = isReady ? Math.min(1, captureTimer / captureThreshold) : 0;
+            console.log(`[Worker] 📨 ID_CAPTURE FRAME_RESULT: isReady=${isReady}, feedback="${feedback}", progress=${progress.toFixed(2)}, timer=${captureTimer}/${captureThreshold.toFixed(1)}`);
             self.postMessage({ type: 'FRAME_RESULT', stage, feedback: debounceFeedback(feedback), isReady, boundingBox, capturedImage, isMocking: false, progress });
         }
 
