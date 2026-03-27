@@ -2,6 +2,7 @@ export const KYCStage = {
   PRE_FLIGHT: 'PRE_FLIGHT',
   ID_CAPTURE: 'ID_CAPTURE',
   FACE_CAPTURE: 'FACE_CAPTURE',
+  VERIFICATION: 'VERIFICATION',
   DONE: 'DONE',
 } as const;
 
@@ -19,3 +20,13 @@ export type WorkerMessage = {
   isMocking?: boolean;
   progress?: number;
 };
+
+export interface VerifyFaceResponse {
+  success: boolean;
+  message: string;
+  similarity?: number;
+  matchConfidence?: number;
+  matchStatus?: 'MATCHED' | 'NOT_MATCHED' | 'PARTIAL_MATCH';
+  errorCode?: string;
+  [key: string]: any;
+}

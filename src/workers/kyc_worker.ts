@@ -65,7 +65,7 @@ const CONFIG = {
     FACE_MIN_WIDTH_RATIO_MOBILE: 0.10, // Face must take up at least 10% of the frame width (mobile - relaxed for low-end devices)
     FACE_CENTER_TOLERANCE: 0.25, // Face must be within 25% of the center
     FACE_CENTER_TOLERANCE_MOBILE: 0.25, // Face must be within 30% of the center (mobile - more forgiving)
-    FACE_MIN_EAR: 0.2,        // Minimum Eye Aspect Ratio (openness)
+    FACE_MIN_EAR: 0.15,        // Minimum Eye Aspect Ratio (openness)
     FACE_MAX_GAZE_OFFSET: 0.125, // Maximum gaze offset from center (relaxed for mobile)
     FACE_MAX_POSE_ANGLE: 0.25, // Maximum head pose angle (yaw/pitch in radians, relaxed for mobile)
     FACE_MIN_VARIANCE: 20,    // Minimum Laplacian variance for the face crop (lowered to 40 as requested)

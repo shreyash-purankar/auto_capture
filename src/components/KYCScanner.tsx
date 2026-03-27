@@ -1,4 +1,6 @@
+import { useState, useEffect, useRef } from "react";
 import { useKYCPipeline } from "../hooks/useKYCPipeline";
+import { useVerifyFace, type VerifyFaceResponse } from "../hooks/useVerifyFace";
 import { KYCStage } from "../types/kyc_types";
 
 export default function KYCScanner() {
@@ -20,6 +22,34 @@ export default function KYCScanner() {
     isMirrored,
     resetFlow,
   } = useKYCPipeline();
+
+  const { verifyFace, loading: verifying, error: verifyError, result: verifyResult, reset: resetVerification } = useVerifyFace();
+  
+  // Track previous blob references to detect when new images are captured
+  const prevBlobsRef = useRef<{ id: Blob | null; face: Blob | null }>({ id: null, face: null });
+  
+  // Clear verification state when new images are captured
+  useEffect(() => {
+    if (currentStage === KYCStage.DONE) {
+      const blobsChanged = 
+        capturedIdBlob !== prevBlobsRef.current.id || 
+        capturedFaceBlob !== prevBlobsRef.current.face;
+      
+      if (blobsChanged) {
+        console.log("[KYCScanner] New images captured - verification state cleared, verify button visible");
+        resetVerification();
+        prevBlobsRef.current = { id: capturedIdBlob, face: capturedFaceBlob };
+      }
+    }
+  }, [capturedIdBlob, capturedFaceBlob, currentStage, resetVerification]);
+  
+  // Handle manual verification
+  const handleVerifyClick = async () => {
+    if (capturedIdBlob && capturedFaceBlob) {
+      console.log("[KYCScanner] User clicked verify button");
+      await verifyFace(capturedIdBlob, capturedFaceBlob);
+    }
+  };
 
   return (
     <div className="relative w-full h-dvh bg-black overflow-hidden font-sans select-none flex flex-col md:flex-row">
@@ -51,7 +81,7 @@ export default function KYCScanner() {
         </div>
 
         {/* FLASH EFFECT */}
-        {isReadyForNextStage && progress > 0.9 && (
+        {isReadyForNextStage && progress > 1 && (
           <div className="absolute inset-0 z-40 bg-white pointer-events-none animate-flash" />
         )}
 
@@ -202,35 +232,191 @@ export default function KYCScanner() {
       {currentStage === KYCStage.DONE && (
         <div className="absolute inset-0 z-50 bg-black/90 backdrop-blur-2xl flex flex-col items-center justify-center p-4 sm:p-6 animate-in fade-in duration-700 overflow-y-auto">
           <div className="kyc-glass p-4 sm:p-8 rounded-[30px] sm:rounded-[40px] shadow-[0_0_100px_rgba(16,185,129,0.2)] max-w-sm sm:max-w-md w-full flex flex-col items-center border border-white/20 animate-in zoom-in slide-in-from-bottom-10 duration-500 my-auto">
-            <div className="w-16 sm:w-20 h-16 sm:h-20 bg-emerald-500 text-white rounded-full flex items-center justify-center mb-6 sm:mb-8 shadow-[0_0_40px_rgba(16,185,129,0.5)]">
-              <svg className="w-8 sm:w-10 h-8 sm:h-10" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={4} d="M5 13l4 4L19 7" />
-              </svg>
-            </div>
-
-            <h1 className="text-2xl sm:text-3xl font-black text-white mb-2 text-center tracking-tight">
-              Identity Verified
-            </h1>
-            <p className="text-gray-400 text-xs sm:text-sm mb-8 sm:mb-10 text-center font-medium">Your documents have been processed securely.</p>
-
-            <div className="w-full flex flex-col sm:flex-row gap-4 sm:gap-6 mb-8 sm:mb-12">
-              <div className="flex-1 group">
-                <p className="text-[8px] sm:text-[10px] text-emerald-400 font-black uppercase tracking-widest mb-2 sm:mb-3 text-center opacity-70 group-hover:opacity-100 transition-opacity">ID Card</p>
-                <div className="relative aspect-4/3 rounded-xl sm:rounded-2xl overflow-hidden border-2 border-white/10 group-hover:border-emerald-500/50 transition-all shadow-xl bg-black/40">
-                  <img src={capturedId!} alt="ID" className="w-full h-full object-contain" style={{ imageRendering: 'crisp-edges' }} />
+            
+            {/* Pre-Verification State - Show Images and Verify Button */}
+            {!verifying && !verifyResult && !verifyError && (
+              <>
+                <div className="w-16 sm:w-20 h-16 sm:h-20 bg-emerald-500 text-white rounded-full flex items-center justify-center mb-6 sm:mb-8 shadow-[0_0_40px_rgba(16,185,129,0.5)]">
+                  <svg className="w-8 sm:w-10 h-8 sm:h-10" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={4} d="M5 13l4 4L19 7" />
+                  </svg>
                 </div>
-              </div>
-              <div className="flex-1 group">
-                <p className="text-[8px] sm:text-[10px] text-emerald-400 font-black uppercase tracking-widest mb-2 sm:mb-3 text-center opacity-70 group-hover:opacity-100 transition-opacity">Selfie</p>
-                <div className="relative aspect-4/3 rounded-xl sm:rounded-2xl overflow-hidden border-2 border-white/10 group-hover:border-emerald-500/50 transition-all shadow-xl bg-black/40">
-                  <img src={capturedFace!} alt="Face" className="w-full h-full object-contain" style={{ imageRendering: 'crisp-edges' }} />
-                </div>
-              </div>
-            </div>
 
-            <button onClick={resetFlow} className="w-full py-4 sm:py-5 bg-white text-black font-black rounded-xl sm:rounded-2xl hover:bg-emerald-50 hover:scale-[1.02] active:scale-95 transition-all shadow-2xl uppercase tracking-widest text-xs sm:text-sm">
-              Complete Onboarding
-            </button>
+                <h1 className="text-2xl sm:text-3xl font-black text-white mb-2 text-center tracking-tight">
+                  Documents Captured
+                </h1>
+                <p className="text-gray-400 text-xs sm:text-sm mb-8 sm:mb-10 text-center font-medium">Verify your identity by comparing the images</p>
+
+                {/* Images Display */}
+                <div className="w-full flex flex-col sm:flex-row gap-4 sm:gap-6 mb-8 sm:mb-12">
+                  <div className="flex-1 group">
+                    <p className="text-[8px] sm:text-[10px] text-emerald-400 font-black uppercase tracking-widest mb-2 sm:mb-3 text-center opacity-70 group-hover:opacity-100 transition-opacity">ID Card</p>
+                    <div className="relative aspect-4/3 rounded-xl sm:rounded-2xl overflow-hidden border-2 border-white/10 group-hover:border-emerald-500/50 transition-all shadow-xl bg-black/40">
+                      <img src={capturedId!} alt="ID" className="w-full h-full object-contain" style={{ imageRendering: 'crisp-edges' }} />
+                    </div>
+                  </div>
+                  <div className="flex-1 group">
+                    <p className="text-[8px] sm:text-[10px] text-emerald-400 font-black uppercase tracking-widest mb-2 sm:mb-3 text-center opacity-70 group-hover:opacity-100 transition-opacity">Selfie</p>
+                    <div className="relative aspect-4/3 rounded-xl sm:rounded-2xl overflow-hidden border-2 border-white/10 group-hover:border-emerald-500/50 transition-all shadow-xl bg-black/40">
+                      <img src={capturedFace!} alt="Face" className="w-full h-full object-contain" style={{ imageRendering: 'crisp-edges' }} />
+                    </div>
+                  </div>
+                </div>
+
+                {/* Action Buttons */}
+                <div className="w-full flex flex-col gap-3 sm:gap-4">
+                  <button 
+                    onClick={handleVerifyClick}
+                    disabled={verifying}
+                    className="w-full py-4 sm:py-5 bg-emerald-500 text-white font-black rounded-xl sm:rounded-2xl hover:bg-emerald-400 hover:scale-[1.02] active:scale-95 transition-all shadow-2xl uppercase tracking-widest text-xs sm:text-sm disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {verifying ? "Verifying..." : "Verify Face"}
+                  </button>
+                  <button 
+                    onClick={resetFlow}
+                    className="w-full py-3 sm:py-4 bg-white/10 text-white font-black rounded-xl sm:rounded-2xl hover:bg-white/20 transition-all uppercase tracking-widest text-xs sm:text-sm"
+                  >
+                    Retake Photos
+                  </button>
+                </div>
+              </>
+            )}
+
+            {/* Verification Loading State */}
+            {verifying && (
+              <>
+                <div className="w-16 sm:w-20 h-16 sm:h-20 bg-emerald-500/20 text-emerald-400 rounded-full flex items-center justify-center mb-6 sm:mb-8 shadow-[0_0_40px_rgba(16,185,129,0.3)] animate-pulse">
+                  <svg className="w-8 sm:w-10 h-8 sm:h-10 animate-spin" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="2" fill="none" strokeOpacity="0.25" />
+                    <path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+                  </svg>
+                </div>
+                <h1 className="text-2xl sm:text-3xl font-black text-white mb-2 text-center tracking-tight">
+                  Verifying Face...
+                </h1>
+                <p className="text-gray-400 text-xs sm:text-sm text-center font-medium">Comparing ID and face images</p>
+              </>
+            )}
+
+            {/* Verification Success State */}
+            {!verifying && verifyResult && verifyResult.success && (
+              <>
+                <div className="w-16 sm:w-20 h-16 sm:h-20 bg-emerald-500 text-white rounded-full flex items-center justify-center mb-6 sm:mb-8 shadow-[0_0_40px_rgba(16,185,129,0.5)]">
+                  <svg className="w-8 sm:w-10 h-8 sm:h-10" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={4} d="M5 13l4 4L19 7" />
+                  </svg>
+                </div>
+
+                <h1 className="text-2xl sm:text-3xl font-black text-emerald-400 mb-2 text-center tracking-tight">
+                  Face Match Verified
+                </h1>
+                <p className="text-gray-400 text-xs sm:text-sm mb-6 sm:mb-8 text-center font-medium">{verifyResult.message}</p>
+
+                {/* Result Details */}
+                <div className="w-full bg-white/5 rounded-lg sm:rounded-xl p-4 sm:p-5 mb-8 sm:mb-12 border border-white/10">
+                  {verifyResult.similarity !== undefined && (
+                    <div className="flex items-center justify-between mb-3 sm:mb-4">
+                      <span className="text-gray-400 text-xs sm:text-sm font-medium">Similarity Score</span>
+                      <span className="text-emerald-400 font-black text-sm sm:text-base">{Math.round(verifyResult.similarity as number)}%</span>
+                    </div>
+                  )}
+                  {verifyResult.matchConfidence !== undefined && (
+                    <div className="flex items-center justify-between mb-3 sm:mb-4">
+                      <span className="text-gray-400 text-xs sm:text-sm font-medium">Confidence</span>
+                      <span className="text-emerald-400 font-black text-sm sm:text-base">{Math.round(verifyResult.matchConfidence as number)}%</span>
+                    </div>
+                  )}
+                  {verifyResult.matchStatus && (
+                    <div className="flex items-center justify-between">
+                      <span className="text-gray-400 text-xs sm:text-sm font-medium">Status</span>
+                      <span className="text-emerald-400 font-black text-xs sm:text-sm uppercase">{verifyResult.matchStatus}</span>
+                    </div>
+                  )}
+                </div>
+
+                <button onClick={resetFlow} className="w-full py-4 sm:py-5 bg-white text-black font-black rounded-xl sm:rounded-2xl hover:bg-emerald-50 hover:scale-[1.02] active:scale-95 transition-all shadow-2xl uppercase tracking-widest text-xs sm:text-sm">
+                  Complete Onboarding
+                </button>
+              </>
+            )}
+
+            {/* Verification Failure State */}
+            {!verifying && verifyResult && !verifyResult.success && (
+              <>
+                <div className="w-16 sm:w-20 h-16 sm:h-20 bg-red-500/20 text-red-400 rounded-full flex items-center justify-center mb-6 sm:mb-8 shadow-[0_0_40px_rgba(239,68,68,0.3)]">
+                  <svg className="w-8 sm:w-10 h-8 sm:h-10" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={4} d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                </div>
+                <h1 className="text-2xl sm:text-3xl font-black text-red-400 mb-2 text-center tracking-tight">
+                  Face Match Failed
+                </h1>
+                <p className="text-gray-400 text-xs sm:text-sm mb-6 sm:mb-8 text-center font-medium">{verifyResult.message}</p>
+
+                {/* Result Details */}
+                {(verifyResult.similarity !== undefined || verifyResult.matchConfidence !== undefined) && (
+                  <div className="w-full bg-white/5 rounded-lg sm:rounded-xl p-4 sm:p-5 mb-8 sm:mb-12 border border-white/10">
+                    {verifyResult.similarity !== undefined && (
+                      <div className="flex items-center justify-between mb-3 sm:mb-4">
+                        <span className="text-gray-400 text-xs sm:text-sm font-medium">Similarity Score</span>
+                        <span className="text-red-400 font-black text-sm sm:text-base">{Math.round(verifyResult.similarity as number)}%</span>
+                      </div>
+                    )}
+                    {verifyResult.matchConfidence !== undefined && (
+                      <div className="flex items-center justify-between">
+                        <span className="text-gray-400 text-xs sm:text-sm font-medium">Confidence</span>
+                        <span className="text-red-400 font-black text-sm sm:text-base">{Math.round(verifyResult.matchConfidence as number)}%</span>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                <div className="w-full flex flex-col gap-3 sm:gap-4">
+                  <button 
+                    onClick={() => resetVerification()}
+                    className="w-full py-4 sm:py-5 bg-emerald-500 text-white font-black rounded-xl sm:rounded-2xl hover:bg-emerald-400 hover:scale-[1.02] active:scale-95 transition-all shadow-2xl uppercase tracking-widest text-xs sm:text-sm"
+                  >
+                    Try Again
+                  </button>
+                  <button 
+                    onClick={resetFlow}
+                    className="w-full py-3 sm:py-4 bg-white/10 text-white font-black rounded-xl sm:rounded-2xl hover:bg-white/20 transition-all uppercase tracking-widest text-xs sm:text-sm"
+                  >
+                    Retake Photos
+                  </button>
+                </div>
+              </>
+            )}
+
+            {/* API Error State */}
+            {!verifying && verifyError && (
+              <>
+                <div className="w-16 sm:w-20 h-16 sm:h-20 bg-red-500/20 text-red-400 rounded-full flex items-center justify-center mb-6 sm:mb-8 shadow-[0_0_40px_rgba(239,68,68,0.3)]">
+                  <svg className="w-8 sm:w-10 h-8 sm:h-10" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={4} d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                </div>
+                <h1 className="text-2xl sm:text-3xl font-black text-red-400 mb-2 text-center tracking-tight">
+                  Verification Error
+                </h1>
+                <p className="text-gray-400 text-xs sm:text-sm mb-8 sm:mb-10 text-center font-medium break-all">{verifyError}</p>
+
+                <div className="w-full flex flex-col gap-3 sm:gap-4">
+                  <button 
+                    onClick={() => resetVerification()}
+                    className="w-full py-4 sm:py-5 bg-emerald-500 text-white font-black rounded-xl sm:rounded-2xl hover:bg-emerald-400 hover:scale-[1.02] active:scale-95 transition-all shadow-2xl uppercase tracking-widest text-xs sm:text-sm"
+                  >
+                    Retry Verification
+                  </button>
+                  <button 
+                    onClick={resetFlow}
+                    className="w-full py-3 sm:py-4 bg-white/10 text-white font-black rounded-xl sm:rounded-2xl hover:bg-white/20 transition-all uppercase tracking-widest text-xs sm:text-sm"
+                  >
+                    Start Over
+                  </button>
+                </div>
+              </>
+            )}
           </div>
         </div>
       )}
