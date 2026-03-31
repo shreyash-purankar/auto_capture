@@ -65,7 +65,7 @@ const CONFIG = {
     FACE_MIN_WIDTH_RATIO_MOBILE: 0.10, // Face must take up at least 10% of the frame width (mobile - relaxed for low-end devices)
     FACE_CENTER_TOLERANCE: 0.25, // Face must be within 25% of the center
     FACE_CENTER_TOLERANCE_MOBILE: 0.25, // Face must be within 30% of the center (mobile - more forgiving)
-    FACE_MIN_EAR: 0.15,        // Minimum Eye Aspect Ratio (openness)
+    FACE_MIN_EAR: 0.22,        // Minimum Eye Aspect Ratio (openness)
     FACE_MAX_GAZE_OFFSET: 0.125, // Maximum gaze offset from center (relaxed for mobile)
     FACE_MAX_POSE_ANGLE: 0.25, // Maximum head pose angle (yaw/pitch in radians, relaxed for mobile)
     FACE_MIN_VARIANCE: 20,    // Minimum Laplacian variance for the face crop (lowered to 40 as requested)
@@ -138,11 +138,18 @@ async function initModels(tier?: 'high' | 'low') {
             }
         }
 
-        try {
-            yoloModel = await tf.loadGraphModel('/models/yolo11n_web_model/model.json');
-            console.log("[Worker] YOLOv11 loaded successfully.");
-        } catch (err) {
-            console.warn("[Worker] YOLOv11 model not found, ID detection will be mocked.", err);
+        // Skip YOLO loading on mobile devices - use fallback edge detection instead
+        if (isMobileDevice) {
+            console.log("[Worker] 📱 Mobile device detected - skipping YOLO model loading (using fallback edge detection)");
+            yoloModel = null;
+        } else {
+            try {
+                yoloModel = await tf.loadGraphModel('/models/yolo11n_web_model/model.json');
+                console.log("[Worker] YOLOv11 loaded successfully.");
+            } catch (err) {
+                console.warn("[Worker] YOLOv11 model not found, ID detection will use fallback.", err);
+                yoloModel = null;
+            }
         }
 
         const cdnUrl = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.32/vision_bundle.mjs';
@@ -302,6 +309,7 @@ function getEdgeDensity(data: Uint8ClampedArray, width: number, height: number, 
 }
 
 function findIDCardBoundingBox(data: Uint8ClampedArray, width: number, height: number, faceBox?: { x: number, y: number, w: number, h: number } | null) {
+    console.log(`[Worker] 🔍 Starting ID card detection (${width}x${height})`);
     const scale = 4;
     const w = Math.floor(width / scale);
     const h = Math.floor(height / scale);
@@ -332,6 +340,8 @@ function findIDCardBoundingBox(data: Uint8ClampedArray, width: number, height: n
             const gy = -gray[(y - 1) * w + (x - 1)] - 2 * gray[(y - 1) * w + x] - gray[(y - 1) * w + (x + 1)]
                 + gray[(y + 1) * w + (x - 1)] + 2 * gray[(y + 1) * w + x] + gray[(y + 1) * w + (x + 1)];
             const mag = Math.abs(gx) + Math.abs(gy);
+            // Edge threshold balanced for mobile ID card detection
+            // Detects card boundaries while filtering noise
             if (mag > 100) {
                 edges[y * w + x] = 1;
                 totalEdgePixels++;
@@ -341,7 +351,9 @@ function findIDCardBoundingBox(data: Uint8ClampedArray, width: number, height: n
 
     // Require minimum edge density — prevents detecting blank surfaces or single-color objects
     const minEdges = w * h * 0.008; // At least 0.8% of pixels should be edges
+    console.log(`[Worker] Edge detection: ${totalEdgePixels} pixels (minimum: ${minEdges.toFixed(0)})`);
     if (totalEdgePixels < minEdges) {
+        console.log(`[Worker] ❌ Not enough edges detected`);
         return null;
     }
 
@@ -359,10 +371,16 @@ function findIDCardBoundingBox(data: Uint8ClampedArray, width: number, height: n
         }
     }
 
-    if (totalEdges < w * h * 0.005) return null;
+    console.log(`[Worker] Total edges for projection: ${totalEdges}`);
+    if (totalEdges < w * h * 0.005) {
+        console.log(`[Worker] ❌ Total edges too low for projection`);
+        return null;
+    }
 
-    const colThreshold = Math.max(2, Math.max(...Array.from(colSum)) * 0.1);
-    const rowThreshold = Math.max(2, Math.max(...Array.from(rowSum)) * 0.1);
+    const colThreshold = Math.max(2, Math.max(...Array.from(colSum)) * 0.08); // Relaxed from 0.1
+    const rowThreshold = Math.max(2, Math.max(...Array.from(rowSum)) * 0.08); // Relaxed from 0.1
+    
+    console.log(`[Worker] Thresholds - col: ${colThreshold.toFixed(1)}, row: ${rowThreshold.toFixed(1)}`);
 
     const findLongestSegment = (arr: Int32Array, threshold: number) => {
         let maxStart = 0, maxEnd = 0, maxLen = 0;
@@ -395,23 +413,57 @@ function findIDCardBoundingBox(data: Uint8ClampedArray, width: number, height: n
 
     const xSeg = findLongestSegment(colSum, colThreshold);
     const ySeg = findLongestSegment(rowSum, rowThreshold);
+    
+    console.log(`[Worker] Longest segments - X: ${xSeg.len}/${w} (${(xSeg.len/w*100).toFixed(0)}%), Y: ${ySeg.len}/${h} (${(ySeg.len/h*100).toFixed(0)}%)`);
 
-    // Stricter minimum size requirements
-    if (xSeg.len < w * 0.25 || ySeg.len < h * 0.25) return null;
+    // Minimum size requirements - relaxed for mobile
+    if (xSeg.len < w * 0.20 || ySeg.len < h * 0.20) { // Relaxed from 0.25
+        console.log(`[Worker] ❌ Box too small: ${(xSeg.len/w*100).toFixed(0)}% x ${(ySeg.len/h*100).toFixed(0)}%`);
+        return null;
+    }
+    
+    // Maximum size constraint - ID card shouldn't fill the entire screen (prevents full-screen boxes)
+    // Allow up to 95% of screen to account for close-up shots
+    if (xSeg.len > w * 0.95 || ySeg.len > h * 0.95) {
+        console.log(`[Worker] ❌ Box too large (scaled): ${(xSeg.len/w*100).toFixed(0)}% x ${(ySeg.len/h*100).toFixed(0)}%`);
+        return null;
+    }
 
     const boxW = xSeg.len;
     const boxH = ySeg.len;
     const minX = xSeg.start;
     const minY = ySeg.start;
+    
+    // Require some margin from screen edges - ID shouldn't touch ALL borders
+    // This prevents detecting screen boundaries as the ID card
+    const marginX = w * 0.02; // 2% margin (further relaxed)
+    const marginY = h * 0.02;
+    const touchesLeftEdge = minX < marginX;
+    const touchesRightEdge = (minX + boxW) > (w - marginX);
+    const touchesTopEdge = minY < marginY;
+    const touchesBottomEdge = (minY + boxH) > (h - marginY);
+    
+    // Only reject if box touches ALL 4 edges (likely screen boundaries)
+    // Allow touching 3 edges for close-up shots
+    const edgesTouched = [touchesLeftEdge, touchesRightEdge, touchesTopEdge, touchesBottomEdge].filter(t => t).length;
+    console.log(`[Worker] Box touches ${edgesTouched} edges`);
+    if (edgesTouched === 4) {
+        console.log(`[Worker] ❌ Box touches all 4 edges - rejecting as full-screen detection`);
+        return null;
+    }
 
     // Verify aspect ratio before returning - ID cards have characteristic proportions
     const aspectRatio = boxW / boxH;
     const isValidAspect = Math.abs(aspectRatio - CONFIG.ID_ASPECT_RATIO) < CONFIG.ID_ASPECT_TOLERANCE_MOBILE ||
                           Math.abs((1 / aspectRatio) - CONFIG.ID_ASPECT_RATIO) < CONFIG.ID_ASPECT_TOLERANCE_MOBILE;
     
+    console.log(`[Worker] Aspect ratio: ${aspectRatio.toFixed(2)} (expected ${CONFIG.ID_ASPECT_RATIO.toFixed(2)} ± ${CONFIG.ID_ASPECT_TOLERANCE_MOBILE.toFixed(2)})`);
     if (!isValidAspect) {
+        console.log(`[Worker] ❌ Invalid aspect ratio`);
         return null;
     }
+    
+    console.log(`[Worker] ✅ All checks passed - creating final box`);
 
     const padX = 0; // Removed padding to make box tighter
     const padY = 0;
@@ -423,12 +475,24 @@ function findIDCardBoundingBox(data: Uint8ClampedArray, width: number, height: n
         height: Math.min(height, (boxH + padY * 2) * scale)
     };
 
-    // Final validation: check if the box is too small relative to frame (minimum size)
+    // Final validation: check if the box size is within acceptable range
     const widthRatio = finalBox.width / width;
     const heightRatio = finalBox.height / height;
+    
+    // Minimum size check - ID must be visible enough
     if (widthRatio < CONFIG.ID_MIN_WIDTH_RATIO || heightRatio < (CONFIG.ID_MIN_WIDTH_RATIO / CONFIG.ID_ASPECT_RATIO)) {
+        console.log(`[Worker] Final box too small: ${(widthRatio*100).toFixed(0)}% x ${(heightRatio*100).toFixed(0)}%`);
         return null;
     }
+    
+    // Maximum size check - ID shouldn't cover the entire screen (prevents false full-screen detection)
+    // Relaxed to 95% to allow close-up shots while still preventing screen-boundary detection
+    if (widthRatio > 0.95 || heightRatio > 0.95) {
+        console.log(`[Worker] ❌ Rejected box: too large (${(widthRatio*100).toFixed(0)}% x ${(heightRatio*100).toFixed(0)}% of screen)`);
+        return null;
+    }
+    
+    console.log(`[Worker] ✅✅ Valid ID box detected: ${(widthRatio*100).toFixed(0)}% x ${(heightRatio*100).toFixed(0)}% of screen`);
 
     return finalBox;
 }
@@ -720,14 +784,23 @@ self.onmessage = async (e: MessageEvent) => {
             let isReady = false;
             let capturedImage = null;
 
-            // Use smaller YOLO model on mobile (320px) for better performance while maintaining accuracy
-            const useYOLO = !!yoloModel;
+            // Only use YOLO if model is loaded AND not on mobile device
+            const useYOLO = !!yoloModel && !isMobileDevice;
+            
+            // Log which detection path we're using
+            if (isMobileDevice) {
+                console.log('[Worker] 📱 Mobile: Using fallback edge detection (YOLO skipped for performance)');
+            } else if (useYOLO) {
+                console.log('[Worker] 💻 Desktop: Using YOLO detection');
+            } else {
+                console.log('[Worker] ⚠️ Desktop: YOLO failed to load, using fallback detection');
+            }
             
             if (useYOLO) {
                 try {
-                    // Frame skipping for low-end devices AND mobile (mobile gets more aggressive skipping)
+                    // Frame skipping for low-end devices ONLY (mobile now uses fallback, so no YOLO frame skipping needed)
                     skipCounter++;
-                    const mobileSkipRate = isMobileDevice ? Math.max(frameSkipRate, 2) : frameSkipRate;
+                    const mobileSkipRate = frameSkipRate;
                     if (skipCounter % mobileSkipRate !== 0) {
                         console.log(`[Worker] ⏭️  Skipping frame ${skipCounter} (skip rate: 1/${mobileSkipRate})`);
                         // Send message to release lock, but mark as skip so UI ignores it
@@ -1122,11 +1195,14 @@ self.onmessage = async (e: MessageEvent) => {
                     captureTimer = 0;
                 }
             } else {
-                // FALLBACK ID DETECTION (Using bitmap)
+                // FALLBACK ID DETECTION (Mobile devices + Desktop when YOLO unavailable)
+                console.log('[Worker] Using fallback edge detection for ID card');
                 const imageData = getImageData(bitmap, width, height);
                 const frameData = imageData.data;
                 let faceBox = null;
-                if (faceLandmarker) {
+                
+                // Skip face detection on mobile devices for better performance
+                if (faceLandmarker && !isMobileDevice) {
                     try {
                         const results = faceLandmarker.detect(imageData);
                         if (results.faceLandmarks && results.faceLandmarks.length > 0) {
@@ -1149,7 +1225,8 @@ self.onmessage = async (e: MessageEvent) => {
                 const box = findIDCardBoundingBox(frameData, width, height, faceBox);
 
                 if (!box) {
-                    feedback = faceBox ? "Face detected. Please show only the ID card." : "Show your ID card to the camera.";
+                    // Simplified feedback for mobile (no face detection check)
+                    feedback = (faceBox && !isMobileDevice) ? "Face detected. Please show only the ID card." : "Show your ID card to the camera.";
                     isReady = false;
                     captureTimer = 0;
                     boundingBox = null;

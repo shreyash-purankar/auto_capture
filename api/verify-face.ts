@@ -23,7 +23,16 @@ export default async function handler(req: any, res: any) {
   try {
     const { docFileBase64, userPhotoBase64, bearerToken, similarityThreshold = '75', imageType = '1' } = req.body;
 
-    // console.log('[verify-face API] Received verification request');
+    // Use environment variable if available, otherwise use bearer token from frontend
+    const token = process.env.AADRILA_BEARER_TOKEN || bearerToken;
+    const apiUrl = process.env.AADRILA_API_URL || 'https://uat.aadrila.com/api/v1/verify-face';
+
+    if (!token) {
+      return res.status(400).json({ 
+        error: 'Missing authentication token',
+        message: 'Bearer token not found in environment or request body'
+      });
+    }
 
     if (!docFileBase64 || !userPhotoBase64) {
       return res.status(400).json({ error: 'Missing image data' });
@@ -41,13 +50,11 @@ export default async function handler(req: any, res: any) {
     form.append('SimilarityThreshold', String(similarityThreshold));
     form.append('ImageType', String(imageType));
 
-    // console.log('[verify-face API] Forwarding to Aadrila API...');
-
     // Call the Aadrila API from backend (no CORS)
-    const response = await fetch(process.env.AADRILA_API_URL || 'https://uat.aadrila.com/api/v1/verify-face', {
+    const response = await fetch(apiUrl, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${process.env.AADRILA_BEARER_TOKEN || bearerToken}`,
+        'Authorization': `Bearer ${token}`,
       },
       body: form as any,
     });
@@ -55,15 +62,20 @@ export default async function handler(req: any, res: any) {
     const data = await response.json();
 
     if (!response.ok) {
-      // console.error('[verify-face API] Aadrila error:', data);
-      return res.status(response.status).json(data);
+      // Return detailed error info for debugging
+      return res.status(response.status).json({
+        ...data,
+        debug: {
+          statusCode: response.status,
+          tokenSource: process.env.AADRILA_BEARER_TOKEN ? 'environment' : 'frontend',
+          apiUrl: apiUrl,
+        }
+      });
     }
 
-    // console.log('[verify-face API] Success:', data);
     return res.status(200).json(data);
 
   } catch (error) {
-    // console.error('[verify-face API] Error:', error);
     return res.status(500).json({
       error: 'Verification failed',
       message: error instanceof Error ? error.message : 'Unknown error',
